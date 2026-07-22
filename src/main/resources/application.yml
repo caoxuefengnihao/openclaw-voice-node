@@ -1,0 +1,36 @@
+server:
+  # 默认 8090 避免与已有 Java 项目（8080）冲突，可用 SERVER_PORT=xxxx 覆盖
+  port: ${SERVER_PORT:8090}
+  forward-headers-strategy: framework
+
+openclaw:
+  gateway:
+    # 远程 Gateway 地址（与 custom_node.py 保持一致）
+    url: ws://106.14.164.36:60013
+    # 鉴权 token，从 ~/.openclaw/openclaw.json 读，或用环境变量 OPENCLAW_TOKEN 覆盖
+    token: ${OPENCLAW_TOKEN:PUT_YOUR_GATEWAY_TOKEN_HERE}
+    client-id: node-host
+    client-mode: node
+    role: operator
+    scopes: operator.read,operator.write
+  user:
+    # 跟 custom_node.py 保持一致：feishu user open_id
+    open-id: ou_d5aa91a8b0b72e7d9ef9bdb95794970d
+  agent:
+    id: cto
+  device:
+    # Ed25519 设备密钥持久化路径
+    state-file: ${user.home}/.openclaw-voice-node/device.json
+
+talk:
+  # 默认 mode = stt-tts + managed-room（不依赖 OpenAI Realtime 账号）
+  mode: stt-tts
+  transport: managed-room
+  brain: agent-consult
+
+logging:
+  level:
+    com.openclaw.voicenode: DEBUG
+    org.java_websocket: INFO
+  pattern:
+    console: "%d{HH:mm:ss.SSS} %-5level [%thread] %logger{30} - %msg%n"

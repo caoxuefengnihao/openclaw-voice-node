@@ -1,0 +1,36 @@
+:root {
+  --bg: #0e1016;
+  --panel: #1a1d27;
+  --ink: #e8e8ea;
+  --ink-dim: #9aa0ad;
+  --accent: #4a90d9;
+  --accent-hot: #e0a64d;
+  --green: #4ad17a;
+  --red: #e06464;
+  --border: #2a2d38;
+  font-family: -apple-system, "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+}
+
+* { box-sizing: border-box; }
+
+html, body, #app {
+  margin: 0; padding: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--ink);
+}
+
+button {
+  font: inherit;
+  cursor: pointer;
+  background: var(--panel);
+  color: var(--ink);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px 24px;
+  transition: all 0.15s ease;
+}
+button:hover { border-color: var(--accent); }
+button:disabled { opacity: 0.4; cursor: not-allowed; }
+button.primary { background: var(--accent); border-color: var(--accent); color: white; }
+button.hot { background: var(--accent-hot); border-color: var(--accent-hot); color: white; }
