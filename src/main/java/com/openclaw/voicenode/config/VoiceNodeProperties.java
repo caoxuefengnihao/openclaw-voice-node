@@ -22,6 +22,8 @@ public record VoiceNodeProperties(
     public record Talk(String mode, String transport, String brain) {}
 
     public String sessionKey() {
-        return "agent:" + agent.id() + ":feishu:direct:" + user.openId();
+        // 用 agent 的 main session（通用于所有非 channel-owned 的 node）
+        // 如果想接飞书上下文得走个过渡的 sessions.create + 绑定，这里暂不支持
+        return "agent:" + agent.id() + ":main";
     }
 }

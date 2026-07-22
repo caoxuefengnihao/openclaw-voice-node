@@ -1,29 +1,18 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onBeforeUnmount } from 'vue'
 import { VoiceClient } from './api/voiceClient'
-import { AudioCapture } from './audio/capture'
-import { AudioPlayer } from './audio/playback'
 
-type Status = 'idle' | 'connecting' | 'ready' | 'listening' | 'speaking' | 'error'
+type Status = 'idle' | 'connecting' | 'ready' | 'listening' | 'thinking' | 'speaking' | 'error'
 
 const status = ref<Status>('idle')
-const statusText = computed(() => ({
-  idle: '未连接',
-  connecting: '连接中…',
-  ready: '就绪',
-  listening: '听你说…',
-  speaking: 'CTO 在说…',
-  error: '错误',
-})[status.value])
-
 const userTranscript = ref('')
 const assistantTranscript = ref('')
 const sessionId = ref('')
 const errorMsg = ref('')
 
 let client: VoiceClient
-let capture: AudioCapture | null = null
-let player: AudioPlayer
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+let recognition: any = null
 
 function setStatus(s: Status, msg?: string) {
   status.value = s
@@ -31,93 +20,204 @@ function setStatus(s: Status, msg?: string) {
   else if (s !== 'error') errorMsg.value = ''
 }
 
+const statusText = computed(() => ({
+  idle: '未连接',
+  connecting: '连接中…',
+  ready: '就绪',
+  listening: '听你说…',
+  thinking: '思考中…',
+  speaking: '播放中…',
+  error: '错误',
+}[status.value]))
+
+// ============== 浏览器原生 TTS ==============
+let zhVoice: SpeechSynthesisVoice | null = null
+
+function loadVoices() {
+  if (!('speechSynthesis' in window)) return
+  const voices = window.speechSynthesis.getVoices()
+  // 优先选中文声音（macOS 自带 Tingting / Sin-ji / Mei-Jia 等）
+  zhVoice = voices.find(v => v.lang === 'zh-CN' || v.lang === 'cmn-Hans-CN')
+    || voices.find(v => v.lang?.startsWith('zh'))
+    || voices.find(v => v.lang?.startsWith('cmn'))
+    || null
+  if (zhVoice) console.log('[tts] 使用声音:', zhVoice.name, zhVoice.lang)
+}
+
+function speak(text: string) {
+  if (!('speechSynthesis' in window) || !text.trim()) return
+  // 停掉之前的
+  window.speechSynthesis.cancel()
+  const u = new SpeechSynthesisUtterance(text)
+  u.lang = 'zh-CN'
+  if (zhVoice) u.voice = zhVoice
+  u.rate = 1.0
+  u.pitch = 1.0
+  u.volume = 1.0
+  u.onstart = () => {
+    console.log('[tts] start')
+    setStatus('speaking')
+  }
+  u.onend = () => {
+    console.log('[tts] end')
+    if (status.value === 'speaking') setStatus('ready')
+  }
+  u.onerror = (e) => {
+    console.warn('[tts] error:', e)
+    if (status.value === 'speaking') setStatus('ready')
+  }
+  window.speechSynthesis.speak(u)
+}
+
+// ============== 浏览器原生 STT ==============
+function setupRecognition() {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const SR = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition
+  if (!SR) {
+    setStatus('error', '浏览器不支持 Web Speech API（用 Chrome）')
+    return null
+  }
+
+  const r = new SR()
+  r.continuous = false
+  r.interimResults = true
+  r.lang = 'zh-CN'
+  r.maxAlternatives = 1
+
+  r.onstart = () => console.log('[stt] started')
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  r.onresult = (event: any) => {
+    let interim = ''
+    let final = ''
+    for (let i = event.resultIndex; i < event.results.length; i++) {
+      const res = event.results[i]
+      if (res.isFinal) {
+        final += res[0].transcript
+      } else {
+        interim += res[0].transcript
+      }
+    }
+    if (interim) {
+      userTranscript.value = interim
+      console.log('[stt] interim:', interim)
+    }
+    if (final) {
+      userTranscript.value = final
+      console.log('[stt] final:', final, '→ send to Java')
+      client?.sendText(final)
+      setStatus('thinking')
+    }
+  }
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  r.onerror = (event: any) => {
+    console.error('[stt] error:', event.error, event.message)
+    if (event.error === 'no-speech' || event.error === 'aborted') {
+      if (status.value === 'listening') setStatus('ready')
+      return
+    }
+    setStatus('error', '识别错误: ' + event.error)
+  }
+
+  r.onend = () => {
+    console.log('[stt] ended')
+    if (status.value === 'listening') setStatus('ready')
+  }
+
+  return r
+}
+
+// ============== WS 协议 ==============
 function connect() {
   setStatus('connecting')
   client = new VoiceClient()
 
-  client.on('open', () => {
-    console.log('WS open')
-  })
-
+  client.on('open', () => console.log('[ws] open'))
   client.on('ready', (msg) => {
     setStatus('ready')
-    sessionId.value = msg.sessionId
-    console.log('Talk session ready:', msg)
-  })
-
-  client.on('transcript.delta', (msg) => {
-    userTranscript.value = msg.text
-    setStatus('listening')
-  })
-
-  client.on('transcript.done', (msg) => {
-    userTranscript.value = msg.text
+    sessionId.value = msg.sessionKey || ''
+    console.log('[ws] ready:', msg)
   })
 
   client.on('assistant', (msg) => {
-    assistantTranscript.value = msg.text
-    setStatus('speaking')
-  })
-
-  client.on('audio', (msg) => {
-    player.feed(msg.data)
+    assistantTranscript.value = (assistantTranscript.value || '') + (msg.text || '')
+    if (status.value === 'ready') setStatus('thinking')
   })
 
   client.on('turn.done', () => {
-    setStatus('ready')
+    console.log('[ws] turn.done, assistant text length:', assistantTranscript.value.length)
+    // 浏览器自己用 speechSynthesis 念
+    if (assistantTranscript.value.trim()) {
+      speak(assistantTranscript.value)
+    } else {
+      setStatus('ready')
+    }
   })
 
   client.on('error', (msg) => {
-    console.error('WS error', msg)
+    console.error('[ws] error:', msg)
     setStatus('error', String(msg))
   })
 
   client.on('close', (code, reason) => {
-    console.log('WS closed', code, reason)
-    setStatus('idle')
+    console.log('[ws] closed', code, reason)
+    if (status.value !== 'error') setStatus('idle')
   })
 
   client.connect()
 }
 
 async function onPttDown() {
-  if (status.value !== 'ready') return
+  if (status.value !== 'ready') {
+    console.warn('Not ready, status=', status.value)
+    return
+  }
+  if (!recognition) {
+    setStatus('error', '未初始化 STT')
+    return
+  }
   userTranscript.value = ''
   assistantTranscript.value = ''
-  player.flush()
-  client.sendCommand({ cmd: 'startTurn' })
-  capture = new AudioCapture((pcm) => {
-    client.sendAudio(pcm)
-  })
+
   try {
-    await capture.start()
+    recognition.start()
     setStatus('listening')
   } catch (e) {
-    setStatus('error', '麦克风权限被拒: ' + String(e))
-    capture = null
+    console.error('[stt] start failed:', e)
+    setStatus('error', '无法启动识别: ' + e)
   }
 }
 
 function onPttUp() {
-  if (capture) {
-    capture.stop()
-    capture = null
-  }
-  if (status.value === 'listening') {
-    client.sendCommand({ cmd: 'endTurn' })
-    setStatus('ready')
+  if (recognition && status.value === 'listening') {
+    try {
+      recognition.stop()
+    } catch (e) {
+      console.warn('[stt] stop error:', e)
+    }
   }
 }
 
 onMounted(() => {
-  player = new AudioPlayer()
+  // 加载声音列表（macOS 异步）
+  if ('speechSynthesis' in window) {
+    loadVoices()
+    window.speechSynthesis.onvoiceschanged = loadVoices
+  }
+  recognition = setupRecognition()
+  if (!recognition) return
   connect()
 })
 
 onBeforeUnmount(() => {
-  capture?.stop()
+  if (recognition) {
+    try { recognition.abort() } catch { /* ignore */ }
+  }
+  if ('speechSynthesis' in window) {
+    try { window.speechSynthesis.cancel() } catch { /* ignore */ }
+  }
   client?.close()
-  player?.close()
 })
 </script>
 
@@ -131,12 +231,12 @@ onBeforeUnmount(() => {
     <section v-if="errorMsg" class="error">{{ errorMsg }}</section>
 
     <section v-if="sessionId" class="meta">
-      session: <code>{{ sessionId.slice(0, 12) }}…</code>
+      session: <code>{{ sessionId.slice(0, 40) }}…</code>
     </section>
 
     <section class="controls">
       <button
-        v-if="status === 'ready' || status === 'listening' || status === 'speaking'"
+        v-if="status === 'ready' || status === 'listening' || status === 'speaking' || status === 'thinking'"
         :class="status === 'listening' ? 'hot' : 'primary'"
         @pointerdown="onPttDown"
         @pointerup="onPttUp"
@@ -161,7 +261,7 @@ onBeforeUnmount(() => {
     </section>
 
     <footer>
-      <small>Vue + Spring Boot + OpenClaw Gateway · stt-tts / managed-room</small>
+      <small>Vue + Spring Boot + OpenClaw · 浏览器 STT/TTS · 纯文本 chat 代理</small>
     </footer>
   </div>
 </template>
@@ -195,9 +295,11 @@ header h1 { margin: 0; font-size: 20px; }
 }
 .status.ready { background: var(--green); color: #0a2a14; }
 .status.listening { background: var(--accent); color: white; }
+.status.thinking { background: var(--accent); color: white; opacity: 0.7; }
 .status.speaking { background: var(--accent-hot); color: #2a1a00; }
 .status.error { background: var(--red); color: white; }
 .status.connecting { background: var(--accent); color: white; opacity: 0.6; }
+.status.idle { background: var(--panel); color: var(--ink-dim); }
 
 .meta { font-size: 12px; color: var(--ink-dim); }
 .meta code { background: var(--panel); padding: 2px 6px; border-radius: 4px; }

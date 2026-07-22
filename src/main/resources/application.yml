@@ -12,12 +12,12 @@ openclaw:
     client-id: node-host
     client-mode: node
     role: operator
-    scopes: operator.read,operator.write
+    scopes: operator.read,operator.write,operator.admin
   user:
     # 跟 custom_node.py 保持一致：feishu user open_id
     open-id: ou_d5aa91a8b0b72e7d9ef9bdb95794970d
   agent:
-    id: cto
+    id: cto   # 临时切 main（cto 太啰嗦，今天先跑通；以后调好 cto 再切回去）
   device:
     # Ed25519 设备密钥持久化路径
     state-file: ${user.home}/.openclaw-voice-node/device.json

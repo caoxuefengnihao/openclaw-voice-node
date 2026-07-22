@@ -8,31 +8,35 @@ import com.openclaw.voicenode.gateway.KeyManager;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
-import org.springframework.web.socket.*;
+import org.springframework.web.socket.BinaryMessage;
+import org.springframework.web.socket.CloseStatus;
+import org.springframework.web.socket.TextMessage;
+import org.springframework.web.socket.WebSocketSession;
 import org.springframework.web.socket.handler.AbstractWebSocketHandler;
 
-import java.nio.ByteBuffer;
-import java.util.Base64;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.UUID;
 
 /**
- * 浏览器 ↔ Java ↔ OpenClaw Gateway 的桥接。
+ * 浏览器 ↔ Java ↔ OpenClaw Gateway 桥接。
  *
- * 每个 browser 连接 = 一个 GatewayClient + 一个 talk session。
+ * 模式：**Chat-proxy（STT/TTS 全在浏览器）**
+ * - 浏览器用 Web Speech API 做 STT（识别）
+ * - 浏览器用 SpeechSynthesis API 做 TTS（播音）
+ * - Java 只是个 chat 代理：把浏览器识别的 text 转发给 Gateway chat.send
+ *   再把 Gateway 返回的 agent response text 推回浏览器
+ * - 整个链路无音频数据流，最快最稳
  *
- * 浏览器 → Java:
- *   - Binary frame:  PCM Int16 16kHz mono（直接转发给 gateway 的 talk.session.appendAudio）
- *   - Text frame:    {cmd: "startTurn" | "endTurn" | "cancelTurn" | "close"}
+ * 上行（浏览器 → Java）：
+ *   { type: "text", content: "..." }  → 调 Gateway chat.send
+ *   { type: "ping" }
  *
- * Java → 浏览器:
- *   - {type: "ready", sessionId}
- *   - {type: "transcript.delta", text}    中间识别文字
- *   - {type: "transcript.done", text}     最终识别文字
- *   - {type: "assistant", text}           assistant 回复文字
- *   - {type: "audio", data: "<b64>"}      TTS 音频帧
- *   - {type: "turn.done"}                 当前 turn 结束
- *   - {type: "error", message}
+ * 下行（Java → 浏览器）：
+ *   { type: "ready", sessionKey }
+ *   { type: "assistant", text }        （agent response 流切片）
+ *   { type: "turn.done" }              （回复完整，浏览器自己用 speechSynthesis 念）
+ *   { type: "error", message }
  */
 @Slf4j
 @Component
@@ -45,112 +49,97 @@ public class VoiceWebSocketHandler extends AbstractWebSocketHandler {
     private final ObjectMapper mapper = new ObjectMapper();
 
     private static final String ATTR_GATEWAY = "gateway";
-    private static final String ATTR_TALK_SESSION = "talkSessionId";
+    private static final String ATTR_BUFFER = "assistantBuffer";
 
     @Override
     public void afterConnectionEstablished(WebSocketSession session) throws Exception {
         log.info("Browser WS connected: {}", session.getId());
 
-        // 1. 连 gateway
+        // 1. 连 Gateway（admin scope + cto Feishu sessionKey）
         GatewayClient gw = new GatewayClient(props, keyManager);
         gw.connect();
 
-        // 2. 创建 talk session
-        Map<String, Object> params = new LinkedHashMap<>();
-        params.put("mode", talkProps.mode());
-        params.put("transport", talkProps.transport());
-        params.put("brain", talkProps.brain());
-        params.put("sessionKey", props.sessionKey());
-
-        Map<String, Object> resp = gw.sendRequest("talk.session.create", params, 30);
-        Map<String, Object> payload = (Map<String, Object>) resp.get("payload");
-        String talkSessionId = (String) payload.get("sessionId");
-        log.info("Talk session created: {}", talkSessionId);
-
-        // 3. 订阅 gateway 事件，按 sessionId 过滤后转发到浏览器
+        // 2. 订阅 agent 事件
         gw.onEvent(msg -> {
             try {
-                if (!"event".equals(msg.get("type"))) return;
-                String eventName = (String) msg.get("event");
-                if (!"talk.event".equals(eventName)) return;
-
-                Map<String, Object> evPayload = (Map<String, Object>) msg.get("payload");
-                if (evPayload == null) return;
-                String sid = (String) evPayload.get("sessionId");
-                if (sid == null || !sid.equals(talkSessionId)) return;
-
-                // 翻译成浏览器友好的事件
-                String type = (String) evPayload.get("type");
-                Object data = evPayload.get("data");
-                if (data instanceof Map<?, ?> dm) {
-                    Map<String, Object> dataMap = (Map<String, Object>) dm;
-                    switch (type == null ? "" : type) {
-                        case "transcript.delta" -> sendToBrowser(session, Map.of(
-                                "type", "transcript.delta",
-                                "text", dataMap.getOrDefault("text", "")
-                        ));
-                        case "transcript.done" -> sendToBrowser(session, Map.of(
-                                "type", "transcript.done",
-                                "text", dataMap.getOrDefault("text", "")
-                        ));
-                        case "assistant.delta" -> sendToBrowser(session, Map.of(
-                                "type", "assistant",
-                                "text", dataMap.getOrDefault("text", "")
-                        ));
-                        case "assistant.done" -> sendToBrowser(session, Map.of(
-                                "type", "assistant",
-                                "text", dataMap.getOrDefault("text", ""),
-                                "final", true
-                        ));
-                        case "audio" -> {
-                            Object audio = dataMap.get("audio");
-                            if (audio != null) {
-                                sendToBrowser(session, Map.of(
-                                        "type", "audio",
-                                        "data", audio.toString()
-                                ));
-                            }
-                        }
-                        case "turn.done", "done" -> sendToBrowser(session, Map.of("type", "turn.done"));
-                        default -> log.debug("未处理 talk event type={}", type);
+                if (!"event".equals(msg.get("type"))) {
+                    // 这里处理的是 res + event 都会走这里
+                    String type = (String) msg.get("type");
+                    if ("res".equals(type)) {
+                        String id = (String) msg.get("id");
+                        log.info("📥 收到 res: id={}, ok={}", id, msg.get("ok"));
                     }
+                    return;
                 }
+                String eventName = (String) msg.get("event");
+                Map<String, Object> payload = (Map<String, Object>) msg.get("payload");
+                // 调试：先看前几个事件详情
+                Integer evtCount = (Integer) session.getAttributes().get("evtCount");
+                if (evtCount == null) evtCount = 0;
+                evtCount++;
+                session.getAttributes().put("evtCount", evtCount);
+                if (evtCount <= 10) {
+                    log.info("📨 event #{}: name={}, stream={}, data={}",
+                            evtCount,
+                            eventName,
+                            payload == null ? "null" : payload.get("stream"),
+                            payload == null ? "null" : payload.get("data"));
+                }
+
+                if (!"agent".equals(eventName) && !"chat".equals(eventName)) return;
+                if (payload == null) return;
+
+                String stream = (String) payload.get("stream");
+
+                if ("response".equals(stream)) {
+                    // LLM 响应文本切片（用 delta 不要 text，避免重复发累积）
+                    Object data = payload.get("data");
+                    String text = null;
+                    if (data instanceof Map<?, ?> dm) {
+                        Object delta = dm.get("delta");
+                        Object txt = dm.get("text");
+                        // 优先 delta（增量）；没有 delta 就用 text（兼容老格式）
+                        if (delta instanceof String s && !s.isEmpty()) {
+                            text = s;
+                        } else if (txt instanceof String s2 && !s2.isEmpty()) {
+                            text = s2;
+                        }
+                    } else if (data instanceof String s) {
+                        text = s;
+                    }
+                    if (text != null && !text.isEmpty()) {
+                        StringBuilder buf = (StringBuilder) session.getAttributes().get(ATTR_BUFFER);
+                        if (buf != null) buf.append(text);
+                        log.info("📝 响应 delta ({} chars): {}", text.length(),
+                                text.length() > 50 ? text.substring(0, 50) + "..." : text);
+                        sendToBrowser(session, Map.of("type", "assistant", "text", text));
+                    }
+                } else if ("done".equals(stream) || "end".equals(stream) || "complete".equals(stream)
+                        || "end".equals(String.valueOf(payload.get("kind")))) {
+                    // 回复完整
+                    log.info("✅ turn done, accumulated text length: {}",
+                            session.getAttributes().get(ATTR_BUFFER) == null ? 0
+                                    : ((StringBuilder) session.getAttributes().get(ATTR_BUFFER)).length());
+                    StringBuilder buf = (StringBuilder) session.getAttributes().get(ATTR_BUFFER);
+                    if (buf != null) buf.setLength(0);
+                    sendToBrowser(session, Map.of("type", "turn.done"));
+                }
+                // thinking 流不转发
             } catch (Exception e) {
-                log.warn("转发 talk event 失败: {}", e.getMessage());
+                log.warn("处理 gateway event 失败: {}", e.getMessage(), e);
             }
         });
 
-        // 4. 存到 session attributes
         session.getAttributes().put(ATTR_GATEWAY, gw);
-        session.getAttributes().put(ATTR_TALK_SESSION, talkSessionId);
+        session.getAttributes().put(ATTR_BUFFER, new StringBuilder());
 
-        // 5. 通知浏览器准备好了
-        sendToBrowser(session, Map.of(
-                "type", "ready",
-                "sessionId", talkSessionId,
-                "transport", talkProps.transport(),
-                "mode", talkProps.mode()
-        ));
+        // 3. 通知浏览器就绪
+        sendToBrowser(session, Map.of("type", "ready", "sessionKey", props.sessionKey()));
     }
 
     @Override
     protected void handleBinaryMessage(WebSocketSession session, BinaryMessage message) {
-        GatewayClient gw = (GatewayClient) session.getAttributes().get(ATTR_GATEWAY);
-        String talkSessionId = (String) session.getAttributes().get(ATTR_TALK_SESSION);
-        if (gw == null || talkSessionId == null) {
-            log.warn("收到 PCM 但 talk session 未就绪");
-            return;
-        }
-
-        ByteBuffer buf = message.getPayload();
-        byte[] pcm = new byte[buf.remaining()];
-        buf.get(pcm);
-        String base64 = Base64.getEncoder().encodeToString(pcm);
-
-        Map<String, Object> params = new LinkedHashMap<>();
-        params.put("sessionId", talkSessionId);
-        params.put("audio", base64);
-        gw.sendFireAndForget("talk.session.appendAudio", params);
+        // chat-proxy 模式：完全不用二进制
     }
 
     @Override
@@ -163,19 +152,30 @@ public class VoiceWebSocketHandler extends AbstractWebSocketHandler {
             return;
         }
 
-        GatewayClient gw = (GatewayClient) session.getAttributes().get(ATTR_GATEWAY);
-        String talkSessionId = (String) session.getAttributes().get(ATTR_TALK_SESSION);
-        if (gw == null || talkSessionId == null) return;
+        String type = (String) msg.get("type");
+        log.info("📥 收到 msg: type={}", type);
 
-        String cmd = (String) msg.get("cmd");
-        if (cmd == null) return;
+        if ("text".equals(type)) {
+            String content = (String) msg.get("content");
+            if (content == null || content.isBlank()) return;
+            GatewayClient gw = (GatewayClient) session.getAttributes().get(ATTR_GATEWAY);
+            if (gw == null) return;
 
-        switch (cmd) {
-            case "startTurn" -> gw.sendFireAndForget("talk.session.startTurn", Map.of("sessionId", talkSessionId));
-            case "endTurn" -> gw.sendFireAndForget("talk.session.endTurn", Map.of("sessionId", talkSessionId));
-            case "cancelTurn" -> gw.sendFireAndForget("talk.session.cancelTurn", Map.of("sessionId", talkSessionId));
-            case "ping" -> sendToBrowser(session, Map.of("type", "pong"));
-            default -> log.debug("未知 cmd: {}", cmd);
+            // 重置 buffer
+            StringBuilder buf = (StringBuilder) session.getAttributes().get(ATTR_BUFFER);
+            if (buf != null) buf.setLength(0);
+
+            log.info("📤 → Gateway chat.send: {}", content);
+
+            Map<String, Object> params = new LinkedHashMap<>();
+            params.put("sessionKey", props.sessionKey());
+            params.put("message", content);
+            params.put("idempotencyKey", UUID.randomUUID().toString());
+            gw.sendFireAndForget("chat.send", params);
+        } else if ("ping".equals(type)) {
+            sendToBrowser(session, Map.of("type", "pong"));
+        } else {
+            log.debug("未知 msg type: {}", type);
         }
     }
 
@@ -183,17 +183,7 @@ public class VoiceWebSocketHandler extends AbstractWebSocketHandler {
     public void afterConnectionClosed(WebSocketSession session, CloseStatus status) {
         log.info("Browser WS closed: {} ({})", session.getId(), status);
         GatewayClient gw = (GatewayClient) session.getAttributes().get(ATTR_GATEWAY);
-        String talkSessionId = (String) session.getAttributes().get(ATTR_TALK_SESSION);
-
-        if (gw != null && talkSessionId != null) {
-            try {
-                gw.sendFireAndForget("talk.session.close", Map.of("sessionId", talkSessionId));
-            } catch (Exception ignore) {
-            }
-        }
-        if (gw != null) {
-            gw.close();
-        }
+        if (gw != null) gw.close();
     }
 
     @Override

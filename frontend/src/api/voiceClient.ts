@@ -56,6 +56,13 @@ export class VoiceClient {
     }
   }
 
+  /**
+   * Chat-mode: 把浏览器 STT 出来的 text 发给 Java
+   */
+  sendText(content: string): void {
+    this.sendCommand({ type: 'text', content })
+  }
+
   on(event: string, handler: Handler): void {
     if (!this.listeners.has(event)) this.listeners.set(event, [])
     this.listeners.get(event)!.push(handler)

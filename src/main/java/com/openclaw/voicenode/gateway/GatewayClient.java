@@ -36,6 +36,8 @@ public class GatewayClient {
 
     private WebSocketClient ws;
     private volatile boolean connected = false;
+    // connect() 阶段用的 hello-ok 等待 future；handleChallenge 把 connect 请求注册到 pending map 时用这个填
+    private volatile CompletableFuture<Map<String, Object>> helloFuture;
 
     public GatewayClient(VoiceNodeProperties props, KeyManager keyManager) {
         this.props = props;
@@ -48,9 +50,7 @@ public class GatewayClient {
     public synchronized void connect() throws Exception {
         if (connected) return;
 
-        CountDownLatch helloLatch = new CountDownLatch(1);
-        AtomicReference<Map<String, Object>> helloResult = new AtomicReference<>();
-        AtomicReference<Exception> helloError = new AtomicReference<>();
+        helloFuture = new CompletableFuture<>();
 
         ws = new WebSocketClient(new URI(props.gateway().url())) {
             @Override
@@ -99,29 +99,28 @@ public class GatewayClient {
         };
 
         // 监听 hello-ok
+        // （死代码：hello-ok 是 "res" 不是 "event"，不会到这里。但留着不影响正确性。）
         onEvent(msg -> {
-            if (msg.get("id") instanceof String idStr && idStr.startsWith("connect-")) {
-                if (Boolean.TRUE.equals(msg.get("ok"))) {
-                    helloResult.set(msg);
-                } else {
-                    helloError.set(new RuntimeException("hello failed: " + msg.get("error")));
-                }
-                helloLatch.countDown();
-            }
+            // no-op
         });
 
         ws.connectBlocking(10, TimeUnit.SECONDS);
-        log.info("WS connected, sending connect...");
+        log.info("WS connected, waiting for hello-ok...");
 
-        // 主动发 connect（因为我们已经在 onMessage 里处理 challenge，但保险起见这里也发）
-        // 实际 challenge 已经在 onMessage 里被处理了，这里只等 hello
-        if (!helloLatch.await(15, TimeUnit.SECONDS)) {
+        Map<String, Object> hello;
+        try {
+            hello = helloFuture.get(15, TimeUnit.SECONDS);
+        } catch (TimeoutException e) {
             ws.closeBlocking();
-            throw new RuntimeException("hello-ok timeout");
+            throw new RuntimeException("hello-ok timeout (challenge handled but no res)", e);
+        } catch (Exception e) {
+            ws.closeBlocking();
+            throw new RuntimeException("hello-ok failed", e);
         }
-        if (helloError.get() != null) throw helloError.get();
+        if (!Boolean.TRUE.equals(hello.get("ok"))) {
+            throw new RuntimeException("hello failed: " + hello.get("error"));
+        }
 
-        Map<String, Object> hello = helloResult.get();
         log.info("✅ connected to gateway: {}", hello.get("payload"));
 
         // 保存 deviceToken（如果返回了新的）
@@ -193,7 +192,13 @@ public class GatewayClient {
             params.put("auth", auth);
             params.put("device", device);
 
-            sendRaw(buildRequestWithId("connect-" + System.currentTimeMillis(), "connect", params));
+            String reqId = "connect-" + System.currentTimeMillis();
+            // 关键：把 hello-ok 等待句柄挂到 pending map，
+            // onMessage 收到 "res" 类型且 id 匹配时才会 complete
+            if (helloFuture != null) {
+                pending.put(reqId, helloFuture);
+            }
+            sendRaw(buildRequestWithId(reqId, "connect", params));
         } catch (Exception e) {
             log.error("handleChallenge failed", e);
         }
