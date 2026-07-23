@@ -11,6 +11,7 @@ export default defineConfig({
   plugins: [vue()],
   server: {
     port: frontendPort,
+    host: true,
     proxy: {
       // Vite dev 时把 WS 代理到 Java 后端，避免 CORS
       '/ws': {
