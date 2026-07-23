@@ -14,7 +14,7 @@ public record VoiceNodeProperties(
 ) {
     public record Gateway(String url, String token, String clientId, String clientMode, String role, String scopes) {}
     public record User(String openId) {}
-    public record Agent(String id) {}
+    public record Agent(String id, String sessionKeyOverride) {}
     public record Device(String stateFile) {}
 
     /** talk.* 段在 application.yml 里独立，不走 openclaw 前缀 */
@@ -22,8 +22,11 @@ public record VoiceNodeProperties(
     public record Talk(String mode, String transport, String brain) {}
 
     public String sessionKey() {
-        // 用 agent 的 main session（通用于所有非 channel-owned 的 node）
-        // 如果想接飞书上下文得走个过渡的 sessions.create + 绑定，这里暂不支持
+        // 优先用 sessionKeyOverride（用飞书 session 时配）
+        if (agent.sessionKeyOverride() != null && !agent.sessionKeyOverride().isBlank()) {
+            return agent.sessionKeyOverride();
+        }
+        // 默认：agent 的 main session
         return "agent:" + agent.id() + ":main";
     }
 }

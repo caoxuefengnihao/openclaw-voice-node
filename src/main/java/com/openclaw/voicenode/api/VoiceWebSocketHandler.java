@@ -171,6 +171,9 @@ public class VoiceWebSocketHandler extends AbstractWebSocketHandler {
             params.put("sessionKey", props.sessionKey());
             params.put("message", content);
             params.put("idempotencyKey", UUID.randomUUID().toString());
+            // 临时 force 不用 reasoning 模型（cto 配的 gpt-5.2 / minimax-m2.5 都开 reasoning → 思考个没完）
+            // qwen-coder-model 是代码模型不行，试 vision-model
+            params.put("model", "qwen-vision-model");
             gw.sendFireAndForget("chat.send", params);
         } else if ("ping".equals(type)) {
             sendToBrowser(session, Map.of("type", "pong"));

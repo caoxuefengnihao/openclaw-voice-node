@@ -17,7 +17,10 @@ openclaw:
     # 跟 custom_node.py 保持一致：feishu user open_id
     open-id: ou_d5aa91a8b0b72e7d9ef9bdb95794970d
   agent:
-    id: cto   # 临时切 main（cto 太啰嗦，今天先跑通；以后调好 cto 再切回去）
+    id: cto
+    # 强制用 cto 的飞书 session（跟 Python custom_node.py 跑通时一样）
+    # 不填的话默认用 agent:cto:main（首次用 cto 会触发"按流程走" → 慢）
+    session-key-override: "agent:cto:feishu:direct:ou_d5aa91a8b0b72e7d9ef9bdb95794970d"
   device:
     # Ed25519 设备密钥持久化路径
     state-file: ${user.home}/.openclaw-voice-node/device.json
