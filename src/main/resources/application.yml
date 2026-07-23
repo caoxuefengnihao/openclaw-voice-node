@@ -26,6 +26,19 @@ openclaw:
   device:
     # Ed25519 设备密钥持久化路径
     state-file: ${user.home}/.openclaw-voice-node/device.json
+  # MiniMax T2A v2 直连配置（P2 用，不过 gateway）
+  # 鉴权靠环境变量 TTS_API_KEY（~/.zshrc 里已 export，不写明文）
+  # API 契约见 /Volumes/ssd/nodejs/node-v26.5.0-darwin-arm64/lib/node_modules/openclaw/dist/tts-BJz6m5ah.js
+  tts:
+    base-url: https://api.minimaxi.com
+    api-key-env: TTS_API_KEY
+    model: speech-2.8-hd
+    voice-id: English_expressive_narrator
+    format: mp3
+    sample-rate: 32000
+    speed: 1.0
+    vol: 1.0
+    pitch: 0
 
 talk:
   # 默认 mode = stt-tts + managed-room（不依赖 OpenAI Realtime 账号）
