@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onBeforeUnmount, nextTick } from 'vue'
 import { VoiceClient } from './api/voiceClient'
+import { AudioRecorder } from './audio/recorder'
 
 type Status = 'idle' | 'connecting' | 'ready' | 'thinking' | 'error'
 
@@ -21,6 +22,8 @@ const inputText = ref('')
 const chatContainer = ref<HTMLElement | null>(null)
 
 let client: VoiceClient | null = null
+const recorder = new AudioRecorder()
+const isRecording = ref(false)
 
 function setStatus(s: Status, msg?: string) {
   status.value = s
@@ -78,6 +81,24 @@ function sendText() {
   // 3. 发到后端
   console.log('[chat] → Java:', text)
   client.sendText(text)
+}
+
+async function micDown() {
+  if (!client || status.value !== 'ready' || isRecording.value) return
+  try {
+    isRecording.value = true
+    await recorder.start(client)
+  } catch (e: any) {
+    isRecording.value = false
+    console.error('[mic] start failed:', e)
+    alert('麦克风权限被拒绝或不可用：' + (e?.message || e))
+  }
+}
+
+function micUp() {
+  if (!isRecording.value) return
+  isRecording.value = false
+  recorder.stop()
 }
 
 function clearChat() {
@@ -146,6 +167,26 @@ function connect() {
     setStatus('error', String(msg?.message || msg))
   })
 
+  // STT 识别结果 (来自 Java 后端 audio.end 后)
+  client.on('user.text', (msg: any) => {
+    const text = msg.text || ''
+    if (!text || !msg.isFinal) return
+    console.log('[ws] user.text:', text)
+    // 推到聊天界面作为 user 消息(供用户看到自己说的什么)
+    messages.value.push({
+      id: genId(),
+      role: 'user',
+      content: text,
+      ts: Date.now(),
+    })
+    scrollToBottom()
+  })
+
+  // 后端确认录音开始
+  client.on('audio.ack', (msg: any) => {
+    console.log('[ws] audio.ack:', msg)
+  })
+
   client.on('close', (code: number, reason: string) => {
     console.log('[ws] closed', code, reason)
     if (status.value !== 'error') setStatus('idle')
@@ -159,6 +200,7 @@ onMounted(() => {
 })
 
 onBeforeUnmount(() => {
+  if (isRecording.value) recorder.cancel()
   client?.close()
 })
 </script>
@@ -210,9 +252,21 @@ onBeforeUnmount(() => {
         @keydown="onKeydown"
         placeholder="输入消息… (Enter 发送, Shift+Enter 换行)"
         rows="2"
-        :disabled="status !== 'ready'"
+        :disabled="status !== 'ready' || isRecording"
         autofocus
       />
+      <button
+        class="mic-btn"
+        :class="{ recording: isRecording }"
+        :disabled="status !== 'ready'"
+        @pointerdown.prevent="micDown"
+        @pointerup.prevent="micUp"
+        @pointerleave.prevent="micUp"
+        @pointercancel.prevent="micUp"
+        :title="isRecording ? '松开发送' : '按住说话'"
+      >
+        {{ isRecording ? '🎙️ 松开发送' : '🎙️' }}
+      </button>
       <button
         class="send-btn"
         :disabled="!canSend"
@@ -403,6 +457,34 @@ header h1 { margin: 0; font-size: 18px; font-weight: 600; }
   cursor: not-allowed;
 }
 .send-btn:not(:disabled):hover { opacity: 0.85; }
+
+.mic-btn {
+  padding: 0 16px;
+  background: var(--panel);
+  color: var(--ink);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-size: 18px;
+  cursor: pointer;
+  transition: all 0.15s;
+  align-self: stretch;
+  user-select: none;
+  -webkit-user-select: none;
+  touch-action: none;
+  min-width: 56px;
+}
+.mic-btn:hover:not(:disabled) { border-color: var(--ink-dim); }
+.mic-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+.mic-btn.recording {
+  background: var(--red);
+  color: white;
+  border-color: var(--red);
+  animation: mic-pulse 1s ease-in-out infinite;
+}
+@keyframes mic-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.6; }
+}
 
 footer { text-align: center; color: var(--ink-dim); margin-top: auto; padding-top: 8px; font-size: 11px; }
 </style>
