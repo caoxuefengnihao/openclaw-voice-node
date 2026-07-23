@@ -18,9 +18,11 @@ openclaw:
     open-id: ou_d5aa91a8b0b72e7d9ef9bdb95794970d
   agent:
     id: cto
-    # 强制用 cto 的飞书 session（跟 Python custom_node.py 跑通时一样）
-    # 不填的话默认用 agent:cto:main（首次用 cto 会触发"按流程走" → 慢）
-    session-key-override: "agent:cto:feishu:direct:ou_d5aa91a8b0b72e7d9ef9bdb95794970d"
+    # session-key-override: "agent:cto:feishu:direct:ou_d5aa91a8b0b72e7d9ef9bdb95794970d"
+    # 2026-07-23 改：默认用 agent:cto:main（零历史）。浏览器对话跟飞书上下文断开，
+    # 但飞书 session 已累积 1.2MB / 378 条 / 150k+ token,每次 chat.send 都要喂全 history,
+    # 导致首字延迟 10s+。改用 main session 让浏览器快速跑通。
+    # 需要恢复飞书互通时,取消上面那行的注释即可。
   device:
     # Ed25519 设备密钥持久化路径
     state-file: ${user.home}/.openclaw-voice-node/device.json
