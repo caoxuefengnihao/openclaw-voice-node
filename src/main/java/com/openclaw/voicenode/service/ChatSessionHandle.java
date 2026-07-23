@@ -38,6 +38,10 @@ public class ChatSessionHandle {
 
     private final StringBuilder assistantBuffer = new StringBuilder();
 
+    // 性能时间打点 (调试 chat 延迟用)
+    private long chatSendAtMs = 0L;       // sendText() 调用时间
+    private long firstDeltaAtMs = 0L;     // 第一个 assistant delta 到达时间
+
     public ChatSessionHandle(WebSocketSession browser, GatewayClient gateway, String sessionKey) {
         this.browser = browser;
         this.gateway = gateway;
@@ -52,10 +56,13 @@ public class ChatSessionHandle {
      */
     public void sendText(String text) {
         if (text == null || text.isBlank()) return;
-        // 重置本轮 buffer
+        // 重置本轮 buffer + 时间打点
         assistantBuffer.setLength(0);
+        chatSendAtMs = System.currentTimeMillis();
+        firstDeltaAtMs = 0L;
 
         log.info("📤 → Gateway chat.send: {}", text);
+        log.info("⏱️ t=0ms  chat.send fired: \"{}\"", text.length() > 30 ? text.substring(0, 30) + "..." : text);
 
         Map<String, Object> params = new LinkedHashMap<>();
         params.put("sessionKey", sessionKey);
@@ -122,6 +129,13 @@ public class ChatSessionHandle {
                 String text = extractAssistantDelta(payload);
                 if (text != null && !text.isEmpty()) {
                     assistantBuffer.append(text);
+                    // 记录首个 delta 时间 (后续 delta 不重复记录)
+                    if (firstDeltaAtMs == 0L && chatSendAtMs > 0L) {
+                        firstDeltaAtMs = System.currentTimeMillis();
+                        long latency = firstDeltaAtMs - chatSendAtMs;
+                        log.info("⏱️ t={}ms  first assistant delta ({} chars, latency from chat.send: {}ms)",
+                                latency, text.length(), latency);
+                    }
                     log.info("📝 响应 delta ({} chars): {}",
                             text.length(),
                             text.length() > 50 ? text.substring(0, 50) + "..." : text);
@@ -195,7 +209,14 @@ public class ChatSessionHandle {
     private void emitTurnDone() {
         int len = assistantBuffer.length();
         assistantBuffer.setLength(0);
-        log.info("✅ turn done, accumulated text length: {}", len);
+        long nowMs = System.currentTimeMillis();
+        long totalMs = (chatSendAtMs > 0L) ? (nowMs - chatSendAtMs) : -1L;
+        if (totalMs >= 0) {
+            log.info("✅ turn done, total {}ms (from chat.send to turn.done, accumulated text {} chars)",
+                    totalMs, len);
+        } else {
+            log.info("✅ turn done, accumulated text length: {}", len);
+        }
         sendToBrowser(Map.of("type", "turn.done"));
     }
 
