@@ -15,6 +15,7 @@ import org.springframework.web.socket.handler.AbstractWebSocketHandler;
 
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.util.Base64;
 import java.util.LinkedHashMap;
 import java.util.Map;
 
@@ -42,16 +43,47 @@ public class VoiceWebSocketHandler extends AbstractWebSocketHandler {
 
     private final ChatBridgeService chatBridge;
     private final SttService sttService;
+    private final com.openclaw.voicenode.service.TtsService ttsService;
     private final ObjectMapper mapper = new ObjectMapper();
 
     private static final String ATTR_CHAT = "chat";
     private static final String ATTR_PCM_BUFFER = "pcmBuffer";
+    private static final String ATTR_AUDIO_STATS = "audioStats";
+
+    /**
+     * 录音过程中的轻量调试统计。判断 mic 到底有没有录到东西:
+     * - chunkCount > 10 且 maxAmp > 1000 → mic 正常,在话
+     * - chunkCount > 10 但 maxAmp ≈ 0 → 浏览器发了 audio 但 mic 没拾到东西 (静音/权限问题)
+     * - chunkCount < 5 → 太短或音频还没传到 STT
+     */
+    private static class AudioStats {
+        int chunkCount = 0;
+        long totalBytes = 0;
+        int maxAmp = 0;  // max |int16 sample| 0..32767
+    }
 
     @Override
     public void afterConnectionEstablished(WebSocketSession session) throws Exception {
         log.info("Browser WS connected: {}", session.getId());
         ChatSessionHandle chat = chatBridge.open(session);
         session.getAttributes().put(ATTR_CHAT, chat);
+
+        // M2: turn.end 回调 → TTS 合成 → 推 assistant.audio
+        // 让 audio.end 后端走的 STT 结果 → chat.sendText → turn.done 时同步触发 TTS
+        chat.addTurnEndListener(fullText -> {
+            try {
+                if (fullText == null || fullText.isBlank()) return;
+                log.info("🔊 M2 turn.done 触发 TTS 合 ({} chars)", fullText.length());
+                byte[] audio = ttsService.synthesize(fullText);
+                sendToBrowser(session, Map.of(
+                        "type", "assistant.audio",
+                        "audio", Base64.getEncoder().encodeToString(audio),
+                        "format", "mp3"
+                ));
+            } catch (Exception e) {
+                log.warn("M2 TTS 合成失败: {}", e.getMessage());
+            }
+        });
     }
 
     @Override
@@ -64,8 +96,23 @@ public class VoiceWebSocketHandler extends AbstractWebSocketHandler {
             log.warn("⚠️ 收到 binary 但无 audio.start,丢弃 {} bytes", message.getPayloadLength());
             return;
         }
+        // 诊断统计: chunk count + bytes + max amplitude
+        AudioStats stats = (AudioStats) session.getAttributes().get(ATTR_AUDIO_STATS);
+        if (stats == null) {
+            stats = new AudioStats();
+            session.getAttributes().put(ATTR_AUDIO_STATS, stats);
+        }
+        byte[] payload = message.getPayload().array();
+        stats.chunkCount++;
+        stats.totalBytes += payload.length;
+        // 高效采样 max amplitude (int16 LE) - 每 80 个样本检查一次
+        for (int i = 0; i < payload.length - 1; i += 160) {
+            short s = (short) ((payload[i] & 0xff) | ((payload[i + 1] & 0xff) << 8));
+            int abs = s < 0 ? -s : s;
+            if (abs > stats.maxAmp) stats.maxAmp = abs;
+        }
         try {
-            buf.write(message.getPayload().array());
+            buf.write(payload);
         } catch (IOException e) {
             log.warn("写 PCM buffer 失败", e);
         }
@@ -92,6 +139,8 @@ public class VoiceWebSocketHandler extends AbstractWebSocketHandler {
         } else if ("audio.start".equals(type)) {
             // 建空 buffer,准备接收 audio.chunk
             session.getAttributes().put(ATTR_PCM_BUFFER, new ByteArrayOutputStream());
+            // 重置诊断统计(新录音清零)
+            session.getAttributes().put(ATTR_AUDIO_STATS, new AudioStats());
             int sampleRate = ((Number) msg.getOrDefault("sampleRate", 16000)).intValue();
             String encoding = (String) msg.getOrDefault("encoding", "pcm_s16le");
             log.info("🎤 audio.start: sampleRate={}, encoding={}", sampleRate, encoding);
@@ -106,8 +155,15 @@ public class VoiceWebSocketHandler extends AbstractWebSocketHandler {
             }
             byte[] pcm = buf.toByteArray();
             session.getAttributes().remove(ATTR_PCM_BUFFER);
-            log.info("🎤 audio.end: {} bytes PCM ({}ms @16kHz)",
-                    pcm.length, pcm.length / 32);
+            // 诊断统计 (在 STT 之前打,这样如果 STT 幻觉能看出是不是数据问题)
+            AudioStats stats = (AudioStats) session.getAttributes().get(ATTR_AUDIO_STATS);
+            session.getAttributes().remove(ATTR_AUDIO_STATS);
+            log.info("🎤 audio.end: {} bytes PCM ({}ms @16kHz) stats={}",
+                    pcm.length, pcm.length / 32,
+                    stats != null
+                        ? String.format("chunks=%d, bytes=%d, maxAmp=%d/32767",
+                                stats.chunkCount, stats.totalBytes, stats.maxAmp)
+                        : "(no stats — 可能浏览器没发 audio.chunk)");
             try {
                 String text = sttService.recognize(pcm);
                 sendToBrowser(session, Map.of(
@@ -115,12 +171,20 @@ public class VoiceWebSocketHandler extends AbstractWebSocketHandler {
                         "text", text,
                         "isFinal", true
                 ));
+
+                // M2: STT 识别的文字当作 chat 输入,触发 cto 回复
+                // turn.done 时上面的监听器会自动拿全文字调 TTS 推 assistant.audio
+                if (chat != null && !text.isBlank()) {
+                    log.info("📤 STT → chat.sendText: \"{}\"", text);
+                    chat.sendText(text);
+                }
             } catch (SttService.SttException e) {
                 log.warn("STT 失败: {}", e.getMessage());
                 sendToBrowser(session, Map.of("type", "error", "message", "STT failed: " + e.getMessage()));
             }
         } else if ("audio.cancel".equals(type)) {
             session.getAttributes().remove(ATTR_PCM_BUFFER);
+            session.getAttributes().remove(ATTR_AUDIO_STATS);
             log.info("🎤 audio.cancel");
         } else if ("ping".equals(type)) {
             try {

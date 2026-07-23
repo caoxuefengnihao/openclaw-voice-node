@@ -7,8 +7,10 @@ import org.springframework.web.socket.TextMessage;
 import org.springframework.web.socket.WebSocketSession;
 
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.CopyOnWriteArrayList;
 
 /**
  * 单个浏览器 WS 的 chat 会话句柄。
@@ -37,6 +39,27 @@ public class ChatSessionHandle {
     private final ObjectMapper mapper = new ObjectMapper();
 
     private final StringBuilder assistantBuffer = new StringBuilder();
+
+    /**
+     * turn.done 回调接口。音频端点订阅这个用来在 turn 走完后调 TTS 合成回放。
+     * 多调用者安全：任意多个 listener 同时收事件。
+     */
+    @FunctionalInterface
+    public interface TurnEndListener {
+        void onTurnEnd(String fullAssistantText);
+    }
+
+    private final List<TurnEndListener> turnEndListeners = new CopyOnWriteArrayList<>();
+
+    /**
+     * 注册 turn.end 回调。一般在 handler / afterConnectionEstablished 调一次。
+     */
+    public void addTurnEndListener(TurnEndListener l) { turnEndListeners.add(l); }
+
+    /**
+     * 移除 turn.end 回调(连接断开清理时用)。
+     */
+    public void removeTurnEndListener(TurnEndListener l) { turnEndListeners.remove(l); }
 
     // 性能时间打点 (调试 chat 延迟用)
     private long chatSendAtMs = 0L;       // sendText() 调用时间
@@ -207,7 +230,8 @@ public class ChatSessionHandle {
     }
 
     private void emitTurnDone() {
-        int len = assistantBuffer.length();
+        String fullText = assistantBuffer.toString();  // 先抓,再 clear
+        int len = fullText.length();
         assistantBuffer.setLength(0);
         long nowMs = System.currentTimeMillis();
         long totalMs = (chatSendAtMs > 0L) ? (nowMs - chatSendAtMs) : -1L;
@@ -218,6 +242,17 @@ public class ChatSessionHandle {
             log.info("✅ turn done, accumulated text length: {}", len);
         }
         sendToBrowser(Map.of("type", "turn.done"));
+
+        // 邀请所有 listener(M2 音频端点订阅这里调 TTS)
+        if (!turnEndListeners.isEmpty()) {
+            for (TurnEndListener l : turnEndListeners) {
+                try {
+                    l.onTurnEnd(fullText);
+                } catch (Exception e) {
+                    log.warn("turnEndListener invoke failed: {}", e.getMessage());
+                }
+            }
+        }
     }
 
     private void sendToBrowser(Map<String, Object> data) {
