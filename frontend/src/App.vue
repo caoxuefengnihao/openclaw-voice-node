@@ -24,6 +24,50 @@ const chatContainer = ref<HTMLElement | null>(null)
 let client: VoiceClient | null = null
 const recorder = new AudioRecorder()
 const isRecording = ref(false)
+const isSpeaking = ref(false)
+
+// ⚠️ Fix 1: mic录音和TTS播音乐合用同一个AudioContext会被状态污染（AudioContext.close后buffer还在引用里）。
+//           现在用完全独立的两套：mic录音 = recorder.ts 自己 new 的 (sampleRate 16000),
+//           播音 = playCtx(默认 sampleRate)，互不干扰。
+let playCtx: AudioContext | null = null
+let currentSource: AudioBufferSourceNode | null = null  // 当前播放的 TTS 音频 source
+const micCooldown = ref(false)  // Fix 2: micUp 后冷却 1.5s,防 TTS 尾巴被 mic 抓
+
+async function playAssistantAudio(base64Audio: string) {
+  try {
+    // base64 → ArrayBuffer
+    const binary = atob(base64Audio)
+    const bytes = new Uint8Array(binary.length)
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i)
+
+    // ⚠️ Fix 1: 用独立的 playCtx,不复用 mic 用的 AudioContext
+    if (!playCtx || playCtx.state === 'closed') {
+      playCtx = new AudioContext()  // 默认 sampleRate (通常是 48kHz)
+      console.log('[audio] playCtx created, sampleRate =', playCtx.sampleRate)
+    }
+    const buffer = await playCtx.decodeAudioData(bytes.buffer)
+
+    // Fix 3: 如果上一段还在播,先停掉 (micDown 也会调,但这里优先)
+    if (currentSource) {
+      try { currentSource.stop() } catch {}
+    }
+    const source = playCtx.createBufferSource()
+    source.buffer = buffer
+    source.connect(playCtx.destination)
+    currentSource = source  // 记住,micDown 时可以暂停
+
+    isSpeaking.value = true
+    source.start()
+    source.onended = () => {
+      isSpeaking.value = false
+      if (currentSource === source) currentSource = null
+    }
+    console.log('[audio] 播放 CTO 回复:', buffer.duration.toFixed(2), '秒')
+  } catch (e: any) {
+    isSpeaking.value = false
+    console.error('[audio] 播放失败:', e)
+  }
+}
 
 function setStatus(s: Status, msg?: string) {
   status.value = s
@@ -84,7 +128,21 @@ function sendText() {
 }
 
 async function micDown() {
+  // Fix 2: 冷却中不开 mic (给 TTS 播放尾巴留时间)
+  if (micCooldown.value) {
+    console.log('[mic] 冷却中,忽略')
+    return
+  }
   if (!client || status.value !== 'ready' || isRecording.value) return
+
+  // Fix 3: 打开 mic 前先停掉当前的 TTS 播放(mic 别录到扬声器)
+  if (currentSource) {
+    try {
+      currentSource.stop()
+      console.log('[mic] 已停当前 TTS 播放,防 mic 录到扬声器')
+    } catch {}
+  }
+
   try {
     isRecording.value = true
     await recorder.start(client)
@@ -99,6 +157,13 @@ function micUp() {
   if (!isRecording.value) return
   isRecording.value = false
   recorder.stop()
+
+  // Fix 2: micUp 后冷却 1.5s — TTS 还没播完时会闪现重复 capture
+  micCooldown.value = true
+  setTimeout(() => {
+    micCooldown.value = false
+    console.log('[mic] 冷却结束,接受下次 mic 输入')
+  }, 1500)
 }
 
 function clearChat() {
@@ -187,6 +252,14 @@ function connect() {
     console.log('[ws] audio.ack:', msg)
   })
 
+  // M2: 收到后端 TTS 合成的音频 → AudioContext 播放
+  client.on('assistant.audio', (msg: any) => {
+    const audio = msg.audio
+    if (!audio) return
+    console.log('[ws] assistant.audio 收到', (audio.length / 4 * 3 / 1024).toFixed(1), 'KB MP3')
+    playAssistantAudio(audio)
+  })
+
   client.on('close', (code: number, reason: string) => {
     console.log('[ws] closed', code, reason)
     if (status.value !== 'error') setStatus('idle')
@@ -211,6 +284,7 @@ onBeforeUnmount(() => {
       <h1>OpenClaw Voice Node · 文字聊天</h1>
       <div class="header-right">
         <span class="status" :class="status">{{ statusText }}</span>
+        <span v-if="isSpeaking" class="status speaking">🔊 说话中…</span>
         <button v-if="status === 'idle' || status === 'error'" class="link" @click="connect">
           {{ status === 'error' ? '重连' : '连接' }}
         </button>
@@ -457,6 +531,16 @@ header h1 { margin: 0; font-size: 18px; font-weight: 600; }
   cursor: not-allowed;
 }
 .send-btn:not(:disabled):hover { opacity: 0.85; }
+
+.speaking {
+  background: #5b8def !important;
+  color: white !important;
+  animation: speaking-pulse 1.2s ease-in-out infinite;
+}
+@keyframes speaking-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.7; }
+}
 
 .mic-btn {
   padding: 0 16px;
