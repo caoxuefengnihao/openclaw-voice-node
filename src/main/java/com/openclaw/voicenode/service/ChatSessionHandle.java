@@ -69,6 +69,11 @@ public class ChatSessionHandle {
     // 都会落到 emitTurnDone(),不加守卫 TTS 会播 2 次。
     private boolean turnDoneEmitted = false;
 
+    // 🔧 delta dedup — OpenClaw gateway 有 bug:同一条 delta 会连发多次 (实证 23:29:16
+    // 140ms 内同一 49-char delta 发 5 次)。短时间窗口内同内容 delta 丢弃。
+    private String lastDeltaText = null;
+    private long lastDeltaAtMs = 0L;
+
     public ChatSessionHandle(WebSocketSession browser, GatewayClient gateway, String sessionKey) {
         this.browser = browser;
         this.gateway = gateway;
@@ -89,6 +94,9 @@ public class ChatSessionHandle {
         // 新一轮 turn 开始,重置一次性守卫
         turnDoneEmitted = false;
         firstDeltaAtMs = 0L;
+        // 新一轮 turn 开始,清掉 delta dedup 状态
+        lastDeltaText = null;
+        lastDeltaAtMs = 0L;
 
         log.info("📤 → Gateway chat.send: {}", text);
         log.info("⏱️ t=0ms  chat.send fired: \"{}\"", text.length() > 30 ? text.substring(0, 30) + "..." : text);
@@ -157,6 +165,17 @@ public class ChatSessionHandle {
             if ("assistant".equals(stream) || "response".equals(stream)) {
                 String text = extractAssistantDelta(payload);
                 if (text != null && !text.isEmpty()) {
+                    // 🔧 delta dedup: OpenClaw gateway 有 bug 会同 delta 连发多次。
+                    // 500ms 窗口内同内容 → 丢弃。
+                    long nowMs = System.currentTimeMillis();
+                    if (text.equals(lastDeltaText) && (nowMs - lastDeltaAtMs) < 500L) {
+                        log.debug("🔁 delta dedup 丢弃重复内容 ({} chars, 在 {}ms 内重复)",
+                                text.length(), nowMs - lastDeltaAtMs);
+                        return;
+                    }
+                    lastDeltaText = text;
+                    lastDeltaAtMs = nowMs;
+
                     assistantBuffer.append(text);
                     // 记录首个 delta 时间 (后续 delta 不重复记录)
                     if (firstDeltaAtMs == 0L && chatSendAtMs > 0L) {
