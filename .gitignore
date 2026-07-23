@@ -24,6 +24,15 @@ run/
 logs/
 *.pid
 
+# STT/TTS 模型（用户拍板 2026-07-23：放项目内但不推 github）
+models/
+!models/.gitkeep
+
+# 本地环境变量（学 dw_auto_platform 模式）
+.env
+.env.local
+.env.*.local
+
 
 # OS
 .DS_Store

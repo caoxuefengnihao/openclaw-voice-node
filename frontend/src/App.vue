@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onBeforeUnmount, nextTick } from 'vue'
 import { VoiceClient } from './api/voiceClient'
+import { AudioRecorder } from './audio/recorder'
 
 type Status = 'idle' | 'connecting' | 'ready' | 'thinking' | 'error'
 
@@ -21,6 +22,52 @@ const inputText = ref('')
 const chatContainer = ref<HTMLElement | null>(null)
 
 let client: VoiceClient | null = null
+const recorder = new AudioRecorder()
+const isRecording = ref(false)
+const isSpeaking = ref(false)
+
+// ⚠️ Fix 1: mic录音和TTS播音乐合用同一个AudioContext会被状态污染（AudioContext.close后buffer还在引用里）。
+//           现在用完全独立的两套：mic录音 = recorder.ts 自己 new 的 (sampleRate 16000),
+//           播音 = playCtx(默认 sampleRate)，互不干扰。
+let playCtx: AudioContext | null = null
+let currentSource: AudioBufferSourceNode | null = null  // 当前播放的 TTS 音频 source
+const micCooldown = ref(false)  // Fix 2: micUp 后冷却 1.5s,防 TTS 尾巴被 mic 抓
+
+async function playAssistantAudio(base64Audio: string) {
+  try {
+    // base64 → ArrayBuffer
+    const binary = atob(base64Audio)
+    const bytes = new Uint8Array(binary.length)
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i)
+
+    // ⚠️ Fix 1: 用独立的 playCtx,不复用 mic 用的 AudioContext
+    if (!playCtx || playCtx.state === 'closed') {
+      playCtx = new AudioContext()  // 默认 sampleRate (通常是 48kHz)
+      console.log('[audio] playCtx created, sampleRate =', playCtx.sampleRate)
+    }
+    const buffer = await playCtx.decodeAudioData(bytes.buffer)
+
+    // Fix 3: 如果上一段还在播,先停掉 (micDown 也会调,但这里优先)
+    if (currentSource) {
+      try { currentSource.stop() } catch {}
+    }
+    const source = playCtx.createBufferSource()
+    source.buffer = buffer
+    source.connect(playCtx.destination)
+    currentSource = source  // 记住,micDown 时可以暂停
+
+    isSpeaking.value = true
+    source.start()
+    source.onended = () => {
+      isSpeaking.value = false
+      if (currentSource === source) currentSource = null
+    }
+    console.log('[audio] 播放 CTO 回复:', buffer.duration.toFixed(2), '秒')
+  } catch (e: any) {
+    isSpeaking.value = false
+    console.error('[audio] 播放失败:', e)
+  }
+}
 
 function setStatus(s: Status, msg?: string) {
   status.value = s
@@ -80,6 +127,45 @@ function sendText() {
   client.sendText(text)
 }
 
+async function micDown() {
+  // Fix 2: 冷却中不开 mic (给 TTS 播放尾巴留时间)
+  if (micCooldown.value) {
+    console.log('[mic] 冷却中,忽略')
+    return
+  }
+  if (!client || status.value !== 'ready' || isRecording.value) return
+
+  // Fix 3: 打开 mic 前先停掉当前的 TTS 播放(mic 别录到扬声器)
+  if (currentSource) {
+    try {
+      currentSource.stop()
+      console.log('[mic] 已停当前 TTS 播放,防 mic 录到扬声器')
+    } catch {}
+  }
+
+  try {
+    isRecording.value = true
+    await recorder.start(client)
+  } catch (e: any) {
+    isRecording.value = false
+    console.error('[mic] start failed:', e)
+    alert('麦克风权限被拒绝或不可用：' + (e?.message || e))
+  }
+}
+
+function micUp() {
+  if (!isRecording.value) return
+  isRecording.value = false
+  recorder.stop()
+
+  // Fix 2: micUp 后冷却 1.5s — TTS 还没播完时会闪现重复 capture
+  micCooldown.value = true
+  setTimeout(() => {
+    micCooldown.value = false
+    console.log('[mic] 冷却结束,接受下次 mic 输入')
+  }, 1500)
+}
+
 function clearChat() {
   if (messages.value.length === 0) return
   if (!confirm('清空聊天记录？')) return
@@ -94,18 +180,17 @@ function onKeydown(e: KeyboardEvent) {
 }
 
 // ============== WS 协议 ==============
-function connect() {
-  setStatus('connecting')
-  client = new VoiceClient()
-
-  client.on('open', () => console.log('[ws] open'))
-  client.on('ready', (msg: any) => {
+function setupClientHandlers(c: VoiceClient) {
+  // 🔧 handler 只注册一次 — 之前 connect() 每次都 client = new VoiceClient() + 注册 9 个 handler,
+  // 点"重连"按钮调多次会生成多个 VoiceClient 实例 + 累积 handler → assistant.audio 播多次。
+  c.on('open', () => console.log('[ws] open'))
+  c.on('ready', (msg: any) => {
     setStatus('ready')
     sessionId.value = msg.sessionKey || ''
     console.log('[ws] ready:', msg)
   })
 
-  client.on('assistant', (msg: any) => {
+  c.on('assistant', (msg: any) => {
     const delta = msg.text || ''
     if (!delta) return
 
@@ -129,7 +214,7 @@ function connect() {
     scrollToBottom()
   })
 
-  client.on('turn.done', () => {
+  c.on('turn.done', () => {
     console.log('[ws] turn.done')
     for (let i = messages.value.length - 1; i >= 0; i--) {
       const m = messages.value[i]
@@ -141,16 +226,53 @@ function connect() {
     setStatus('ready')
   })
 
-  client.on('error', (msg: any) => {
+  c.on('error', (msg: any) => {
     console.error('[ws] error:', msg)
     setStatus('error', String(msg?.message || msg))
   })
 
-  client.on('close', (code: number, reason: string) => {
+  // STT 识别结果 (来自 Java 后端 audio.end 后)
+  c.on('user.text', (msg: any) => {
+    const text = msg.text || ''
+    if (!text || !msg.isFinal) return
+    console.log('[ws] user.text:', text)
+    // 推到聊天界面作为 user 消息(供用户看到自己说的什么)
+    messages.value.push({
+      id: genId(),
+      role: 'user',
+      content: text,
+      ts: Date.now(),
+    })
+    scrollToBottom()
+  })
+
+  // 后端确认录音开始
+  c.on('audio.ack', (msg: any) => {
+    console.log('[ws] audio.ack:', msg)
+  })
+
+  // M2: 收到后端 TTS 合成的音频 → AudioContext 播放
+  c.on('assistant.audio', (msg: any) => {
+    const audio = msg.audio
+    if (!audio) return
+    console.log('[ws] assistant.audio 收到', (audio.length / 4 * 3 / 1024).toFixed(1), 'KB MP3')
+    playAssistantAudio(audio)
+  })
+
+  c.on('close', (code: number, reason: string) => {
     console.log('[ws] closed', code, reason)
     if (status.value !== 'error') setStatus('idle')
   })
+}
 
+function connect() {
+  setStatus('connecting')
+  if (!client) {
+    // 第一次: 建 client + 注册 handler (只一次)
+    client = new VoiceClient()
+    setupClientHandlers(client)
+  }
+  // 之后 (点"重连"按钮): client 已存在,只重建 WebSocket,handler 不重复注册
   client.connect()
 }
 
@@ -159,6 +281,7 @@ onMounted(() => {
 })
 
 onBeforeUnmount(() => {
+  if (isRecording.value) recorder.cancel()
   client?.close()
 })
 </script>
@@ -169,6 +292,7 @@ onBeforeUnmount(() => {
       <h1>OpenClaw Voice Node · 文字聊天</h1>
       <div class="header-right">
         <span class="status" :class="status">{{ statusText }}</span>
+        <span v-if="isSpeaking" class="status speaking">🔊 说话中…</span>
         <button v-if="status === 'idle' || status === 'error'" class="link" @click="connect">
           {{ status === 'error' ? '重连' : '连接' }}
         </button>
@@ -210,9 +334,21 @@ onBeforeUnmount(() => {
         @keydown="onKeydown"
         placeholder="输入消息… (Enter 发送, Shift+Enter 换行)"
         rows="2"
-        :disabled="status !== 'ready'"
+        :disabled="status !== 'ready' || isRecording"
         autofocus
       />
+      <button
+        class="mic-btn"
+        :class="{ recording: isRecording }"
+        :disabled="status !== 'ready'"
+        @pointerdown.prevent="micDown"
+        @pointerup.prevent="micUp"
+        @pointerleave.prevent="micUp"
+        @pointercancel.prevent="micUp"
+        :title="isRecording ? '松开发送' : '按住说话'"
+      >
+        {{ isRecording ? '🎙️ 松开发送' : '🎙️' }}
+      </button>
       <button
         class="send-btn"
         :disabled="!canSend"
@@ -403,6 +539,44 @@ header h1 { margin: 0; font-size: 18px; font-weight: 600; }
   cursor: not-allowed;
 }
 .send-btn:not(:disabled):hover { opacity: 0.85; }
+
+.speaking {
+  background: #5b8def !important;
+  color: white !important;
+  animation: speaking-pulse 1.2s ease-in-out infinite;
+}
+@keyframes speaking-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.7; }
+}
+
+.mic-btn {
+  padding: 0 16px;
+  background: var(--panel);
+  color: var(--ink);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-size: 18px;
+  cursor: pointer;
+  transition: all 0.15s;
+  align-self: stretch;
+  user-select: none;
+  -webkit-user-select: none;
+  touch-action: none;
+  min-width: 56px;
+}
+.mic-btn:hover:not(:disabled) { border-color: var(--ink-dim); }
+.mic-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+.mic-btn.recording {
+  background: var(--red);
+  color: white;
+  border-color: var(--red);
+  animation: mic-pulse 1s ease-in-out infinite;
+}
+@keyframes mic-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.6; }
+}
 
 footer { text-align: center; color: var(--ink-dim); margin-top: auto; padding-top: 8px; font-size: 11px; }
 </style>

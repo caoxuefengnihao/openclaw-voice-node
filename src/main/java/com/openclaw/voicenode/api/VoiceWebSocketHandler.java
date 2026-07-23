@@ -1,10 +1,9 @@
 package com.openclaw.voicenode.api;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.openclaw.voicenode.config.TalkProps;
-import com.openclaw.voicenode.config.VoiceNodeProperties;
-import com.openclaw.voicenode.gateway.GatewayClient;
-import com.openclaw.voicenode.gateway.KeyManager;
+import com.openclaw.voicenode.service.ChatBridgeService;
+import com.openclaw.voicenode.service.ChatSessionHandle;
+import com.openclaw.voicenode.service.SttService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
@@ -14,151 +13,109 @@ import org.springframework.web.socket.TextMessage;
 import org.springframework.web.socket.WebSocketSession;
 import org.springframework.web.socket.handler.AbstractWebSocketHandler;
 
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.util.Base64;
 import java.util.LinkedHashMap;
 import java.util.Map;
-import java.util.UUID;
 
 /**
- * 浏览器 ↔ Java ↔ OpenClaw Gateway 桥接。
+ * 浏览器 ↔ Java ↔ OpenClaw Gateway 桥接 (chat text + audio STT)。
  *
- * 模式：**Chat-proxy（STT/TTS 全在浏览器）**
- * - 浏览器用 Web Speech API 做 STT（识别）
- * - 浏览器用 SpeechSynthesis API 做 TTS（播音）
- * - Java 只是个 chat 代理：把浏览器识别的 text 转发给 Gateway chat.send
- *   再把 Gateway 返回的 agent response text 推回浏览器
- * - 整个链路无音频数据流，最快最稳
+ * 上行(浏览器 → Java):
+ *   chat: { type: "text", content }
+ *   audio: { type: "audio.start", sampleRate, encoding }
+ *          <binary PCM frame>           → 累积到 buffer
+ *          { type: "audio.end" }         → SttService.recognize() 推 user.text
+ *          { type: "audio.cancel" }      → 清空 buffer
+ *   通用: { type: "ping" }
  *
- * 上行（浏览器 → Java）：
- *   { type: "text", content: "..." }  → 调 Gateway chat.send
- *   { type: "ping" }
+ * 下行(Java → 浏览器):
+ *   chat: { type: "ready" / "assistant" / "turn.done" }
+ *   audio: { type: "audio.ack" / "user.text" / "error" }
  *
- * 下行（Java → 浏览器）：
- *   { type: "ready", sessionKey }
- *   { type: "assistant", text }        （agent response 流切片）
- *   { type: "turn.done" }              （回复完整，浏览器自己用 speechSynthesis 念）
- *   { type: "error", message }
+ * chat 协议细节在 ChatSessionHandle,STT 在 SttService,本 handler 只做 WS 路由。
  */
 @Slf4j
 @Component
 @RequiredArgsConstructor
 public class VoiceWebSocketHandler extends AbstractWebSocketHandler {
 
-    private final VoiceNodeProperties props;
-    private final TalkProps talkProps;
-    private final KeyManager keyManager;
+    private final ChatBridgeService chatBridge;
+    private final SttService sttService;
+    private final com.openclaw.voicenode.service.TtsService ttsService;
     private final ObjectMapper mapper = new ObjectMapper();
 
-    private static final String ATTR_GATEWAY = "gateway";
-    private static final String ATTR_BUFFER = "assistantBuffer";
+    private static final String ATTR_CHAT = "chat";
+    private static final String ATTR_PCM_BUFFER = "pcmBuffer";
+    private static final String ATTR_AUDIO_STATS = "audioStats";
+
+    /**
+     * 录音过程中的轻量调试统计。判断 mic 到底有没有录到东西:
+     * - chunkCount > 10 且 maxAmp > 1000 → mic 正常,在话
+     * - chunkCount > 10 但 maxAmp ≈ 0 → 浏览器发了 audio 但 mic 没拾到东西 (静音/权限问题)
+     * - chunkCount < 5 → 太短或音频还没传到 STT
+     */
+    private static class AudioStats {
+        int chunkCount = 0;
+        long totalBytes = 0;
+        int maxAmp = 0;  // max |int16 sample| 0..32767
+    }
 
     @Override
     public void afterConnectionEstablished(WebSocketSession session) throws Exception {
         log.info("Browser WS connected: {}", session.getId());
+        ChatSessionHandle chat = chatBridge.open(session);
+        session.getAttributes().put(ATTR_CHAT, chat);
 
-        // 1. 连 Gateway（admin scope + cto Feishu sessionKey）
-        GatewayClient gw = new GatewayClient(props, keyManager);
-        gw.connect();
-
-        // 2. 订阅 agent 事件
-        gw.onEvent(msg -> {
+        // M2: turn.end 回调 → TTS 合成 → 推 assistant.audio
+        // 让 audio.end 后端走的 STT 结果 → chat.sendText → turn.done 时同步触发 TTS
+        chat.addTurnEndListener(fullText -> {
             try {
-                if (!"event".equals(msg.get("type"))) {
-                    // 这里处理的是 res + event 都会走这里
-                    String type = (String) msg.get("type");
-                    if ("res".equals(type)) {
-                        String id = (String) msg.get("id");
-                        log.info("📥 收到 res: id={}, ok={}", id, msg.get("ok"));
-                    }
-                    return;
-                }
-                String eventName = (String) msg.get("event");
-                Map<String, Object> payload = (Map<String, Object>) msg.get("payload");
-                // 调试：先看前几个事件详情
-                Integer evtCount = (Integer) session.getAttributes().get("evtCount");
-                if (evtCount == null) evtCount = 0;
-                evtCount++;
-                session.getAttributes().put("evtCount", evtCount);
-                if (evtCount <= 10) {
-                    log.info("📨 event #{}: name={}, stream={}, data={}",
-                            evtCount,
-                            eventName,
-                            payload == null ? "null" : payload.get("stream"),
-                            payload == null ? "null" : payload.get("data"));
-                }
-
-                if (!"agent".equals(eventName) && !"chat".equals(eventName)) return;
-                if (payload == null) return;
-
-                String stream = (String) payload.get("stream");
-
-                if ("assistant".equals(stream) || "response".equals(stream)) {
-                    // agent event 的 LLM 响应文本切片
-                    // 老 gateway 叫 "response"，新 gateway 改成了 "assistant"（OpenClaw
-                    // 2026.7.x 起，看 src/infra/agent-events.ts 的 AgentEventStream 枚举）
-                    // 用 delta 不要 text，避免重复发累积
-                    Object data = payload.get("data");
-                    String text = null;
-                    if (data instanceof Map<?, ?> dm) {
-                        Object delta = dm.get("delta");
-                        Object txt = dm.get("text");
-                        // 优先 delta（增量）；没有 delta 就用 text（兼容老格式）
-                        if (delta instanceof String s && !s.isEmpty()) {
-                            text = s;
-                        } else if (txt instanceof String s2 && !s2.isEmpty()) {
-                            text = s2;
-                        }
-                    } else if (data instanceof String s) {
-                        text = s;
-                    }
-                    if (text != null && !text.isEmpty()) {
-                        StringBuilder buf = (StringBuilder) session.getAttributes().get(ATTR_BUFFER);
-                        if (buf != null) buf.append(text);
-                        log.info("📝 响应 delta ({} chars): {}", text.length(),
-                                text.length() > 50 ? text.substring(0, 50) + "..." : text);
-                        sendToBrowser(session, Map.of("type", "assistant", "text", text));
-                    }
-                } else if ("done".equals(stream) || "end".equals(stream) || "complete".equals(stream)
-                        || "end".equals(String.valueOf(payload.get("kind")))) {
-                    // 老 gateway 的 done 信号 (向后兼容)
-                    emitTurnDone(session);
-                } else if ("lifecycle".equals(stream)) {
-                    // 新 gateway (OpenClaw 2026.7.x): agent lifecycle 结束
-                    // 看 src/agents/embedded-agent-subscribe.handlers.compaction.ts:154
-                    // emitAgentEvent({ stream: "lifecycle", data: { phase: "end", ... } })
-                    Object data = payload.get("data");
-                    String phase = null;
-                    if (data instanceof Map<?, ?> dm) {
-                        Object p = dm.get("phase");
-                        if (p instanceof String s) phase = s;
-                    }
-                    if ("end".equals(phase) || "error".equals(phase) || "stop".equals(phase)) {
-                        emitTurnDone(session);
-                    }
-                } else if ("chat".equals(eventName)) {
-                    // 新 gateway: chat 事件用 state 字段 (不是 stream)
-                    // 看 packages/gateway-protocol/src/schema/logs-chat.ts 的 ChatFinalEventSchema
-                    // state: "final" 表示一轮完成
-                    Object state = payload.get("state");
-                    if ("final".equals(state) || "aborted".equals(state) || "error".equals(state)) {
-                        emitTurnDone(session);
-                    }
-                }
-                // thinking 流不转发
+                if (fullText == null || fullText.isBlank()) return;
+                log.info("🔊 M2 turn.done 触发 TTS 合 ({} chars)", fullText.length());
+                byte[] audio = ttsService.synthesize(fullText);
+                sendToBrowser(session, Map.of(
+                        "type", "assistant.audio",
+                        "audio", Base64.getEncoder().encodeToString(audio),
+                        "format", "mp3"
+                ));
             } catch (Exception e) {
-                log.warn("处理 gateway event 失败: {}", e.getMessage(), e);
+                log.warn("M2 TTS 合成失败: {}", e.getMessage());
             }
         });
-
-        session.getAttributes().put(ATTR_GATEWAY, gw);
-        session.getAttributes().put(ATTR_BUFFER, new StringBuilder());
-
-        // 3. 通知浏览器就绪
-        sendToBrowser(session, Map.of("type", "ready", "sessionKey", props.sessionKey()));
     }
 
     @Override
     protected void handleBinaryMessage(WebSocketSession session, BinaryMessage message) {
-        // chat-proxy 模式：完全不用二进制
+        // audio.chunk:浏览器发来的 PCM 帧 (16kHz mono int16 LE)
+        // 累积到 per-session buffer,等 audio.end 时一起送 SttService
+        ByteArrayOutputStream buf = (ByteArrayOutputStream) session.getAttributes().get(ATTR_PCM_BUFFER);
+        if (buf == null) {
+            // 没 audio.start 就直接发 binary,警告但丢弃
+            log.warn("⚠️ 收到 binary 但无 audio.start,丢弃 {} bytes", message.getPayloadLength());
+            return;
+        }
+        // 诊断统计: chunk count + bytes + max amplitude
+        AudioStats stats = (AudioStats) session.getAttributes().get(ATTR_AUDIO_STATS);
+        if (stats == null) {
+            stats = new AudioStats();
+            session.getAttributes().put(ATTR_AUDIO_STATS, stats);
+        }
+        byte[] payload = message.getPayload().array();
+        stats.chunkCount++;
+        stats.totalBytes += payload.length;
+        // 高效采样 max amplitude (int16 LE) - 每 80 个样本检查一次
+        for (int i = 0; i < payload.length - 1; i += 160) {
+            short s = (short) ((payload[i] & 0xff) | ((payload[i + 1] & 0xff) << 8));
+            int abs = s < 0 ? -s : s;
+            if (abs > stats.maxAmp) stats.maxAmp = abs;
+        }
+        try {
+            buf.write(payload);
+        } catch (IOException e) {
+            log.warn("写 PCM buffer 失败", e);
+        }
     }
 
     @Override
@@ -174,30 +131,68 @@ public class VoiceWebSocketHandler extends AbstractWebSocketHandler {
         String type = (String) msg.get("type");
         log.info("📥 收到 msg: type={}", type);
 
+        ChatSessionHandle chat = (ChatSessionHandle) session.getAttributes().get(ATTR_CHAT);
+
         if ("text".equals(type)) {
-            String content = (String) msg.get("content");
-            if (content == null || content.isBlank()) return;
-            GatewayClient gw = (GatewayClient) session.getAttributes().get(ATTR_GATEWAY);
-            if (gw == null) return;
+            if (chat == null) return;
+            chat.sendText((String) msg.get("content"));
+        } else if ("audio.start".equals(type)) {
+            // 建空 buffer,准备接收 audio.chunk
+            session.getAttributes().put(ATTR_PCM_BUFFER, new ByteArrayOutputStream());
+            // 重置诊断统计(新录音清零)
+            session.getAttributes().put(ATTR_AUDIO_STATS, new AudioStats());
+            int sampleRate = ((Number) msg.getOrDefault("sampleRate", 16000)).intValue();
+            String encoding = (String) msg.getOrDefault("encoding", "pcm_s16le");
+            log.info("🎤 audio.start: sampleRate={}, encoding={}", sampleRate, encoding);
+            sendToBrowser(session, Map.of("type", "audio.ack", "state", "recording"));
+        } else if ("audio.end".equals(type)) {
+            // 累积结束,送 STT
+            ByteArrayOutputStream buf = (ByteArrayOutputStream) session.getAttributes().get(ATTR_PCM_BUFFER);
+            if (buf == null || buf.size() == 0) {
+                log.warn("⚠️ audio.end 但 buffer 空/缺失");
+                sendToBrowser(session, Map.of("type", "error", "message", "audio buffer empty"));
+                return;
+            }
+            byte[] pcm = buf.toByteArray();
+            session.getAttributes().remove(ATTR_PCM_BUFFER);
+            // 诊断统计 (在 STT 之前打,这样如果 STT 幻觉能看出是不是数据问题)
+            AudioStats stats = (AudioStats) session.getAttributes().get(ATTR_AUDIO_STATS);
+            session.getAttributes().remove(ATTR_AUDIO_STATS);
+            log.info("🎤 audio.end: {} bytes PCM ({}ms @16kHz) stats={}",
+                    pcm.length, pcm.length / 32,
+                    stats != null
+                        ? String.format("chunks=%d, bytes=%d, maxAmp=%d/32767",
+                                stats.chunkCount, stats.totalBytes, stats.maxAmp)
+                        : "(no stats — 可能浏览器没发 audio.chunk)");
+            try {
+                String text = sttService.recognize(pcm);
+                sendToBrowser(session, Map.of(
+                        "type", "user.text",
+                        "text", text,
+                        "isFinal", true
+                ));
 
-            // 重置 buffer
-            StringBuilder buf = (StringBuilder) session.getAttributes().get(ATTR_BUFFER);
-            if (buf != null) buf.setLength(0);
-
-            log.info("📤 → Gateway chat.send: {}", content);
-
-            Map<String, Object> params = new LinkedHashMap<>();
-            params.put("sessionKey", props.sessionKey());
-            params.put("message", content);
-            params.put("idempotencyKey", UUID.randomUUID().toString());
-            // cto agent 默认配的是 reasoning 模型 (gpt-5.2 / minimax-m2.5:cloud, 见
-            // /Users/caoxuefeng/.openclaw/agents/cto/agent/models.json),会无限思考不出文本。
-            // chat.send 的 thinking 字段 (schema 在 logs-chat.ts:84, 可选值 ["off","xhigh"])
-            // 透传到 LLM 层 enable_thinking=false,临时关掉当次 reasoning。
-            params.put("thinking", "off");
-            gw.sendFireAndForget("chat.send", params);
+                // M2: STT 识别的文字当作 chat 输入,触发 cto 回复
+                // turn.done 时上面的监听器会自动拿全文字调 TTS 推 assistant.audio
+                if (chat != null && !text.isBlank()) {
+                    log.info("📤 STT → chat.sendText: \"{}\"", text);
+                    chat.sendText(text);
+                }
+            } catch (SttService.SttException e) {
+                log.warn("STT 失败: {}", e.getMessage());
+                sendToBrowser(session, Map.of("type", "error", "message", "STT failed: " + e.getMessage()));
+            }
+        } else if ("audio.cancel".equals(type)) {
+            session.getAttributes().remove(ATTR_PCM_BUFFER);
+            session.getAttributes().remove(ATTR_AUDIO_STATS);
+            log.info("🎤 audio.cancel");
         } else if ("ping".equals(type)) {
-            sendToBrowser(session, Map.of("type", "pong"));
+            try {
+                String json = mapper.writeValueAsString(Map.of("type", "pong"));
+                session.sendMessage(new TextMessage(json));
+            } catch (Exception e) {
+                log.warn("send pong 失败: {}", e.getMessage());
+            }
         } else {
             log.debug("未知 msg type: {}", type);
         }
@@ -206,8 +201,8 @@ public class VoiceWebSocketHandler extends AbstractWebSocketHandler {
     @Override
     public void afterConnectionClosed(WebSocketSession session, CloseStatus status) {
         log.info("Browser WS closed: {} ({})", session.getId(), status);
-        GatewayClient gw = (GatewayClient) session.getAttributes().get(ATTR_GATEWAY);
-        if (gw != null) gw.close();
+        ChatSessionHandle chat = (ChatSessionHandle) session.getAttributes().get(ATTR_CHAT);
+        if (chat != null) chat.close();
     }
 
     @Override
@@ -218,22 +213,11 @@ public class VoiceWebSocketHandler extends AbstractWebSocketHandler {
     private void sendToBrowser(WebSocketSession session, Map<String, Object> data) {
         if (!session.isOpen()) return;
         try {
-            String json = mapper.writeValueAsString(data);
+            // 用 LinkedHashMap 保 key 顺序(JSON 输出友好)
+            String json = mapper.writeValueAsString(new LinkedHashMap<>(data));
             session.sendMessage(new TextMessage(json));
         } catch (Exception e) {
             log.warn("sendToBrowser 失败: {}", e.getMessage());
         }
-    }
-
-    /**
-     * 一轮回复结束的统一出口。
-     * 重置 buffer 推送 turn.done 事件，让前端状态从 thinking 回到 ready（输入框解锁）。
-     */
-    private void emitTurnDone(WebSocketSession session) {
-        StringBuilder buf = (StringBuilder) session.getAttributes().get(ATTR_BUFFER);
-        int len = buf == null ? 0 : buf.length();
-        if (buf != null) buf.setLength(0);
-        log.info("✅ turn done, accumulated text length: {}", len);
-        sendToBrowser(session, Map.of("type", "turn.done"));
     }
 }

@@ -597,26 +597,23 @@ async function playAudio(base64Audio: string, format = 'mp3') {
 - 下载 Paraformer-zh INT8 模型(~230MB)到 `/Volumes/ssd/models/sherpa-onnx/paraformer-zh-2023-09-14/`
 - 用 OfflineRecognizer(整段识别)
 
-### T2. TTS persona 默认值 ⏳ 待拍板
+### T2. TTS persona 默认值 ✅ 已拍板(2026-07-23 13:04)
 
-**候选**(minimax T2A v2 内置 voice_id):
-- A) `English_expressive_narrator`(英伦男声,接近 Jarvis)
-- B) `male-qn-qingse`(中文青年男声)
-- C) `male-qn-jingying`(中文精英男声)
-- D) 让用户在前端弹窗里选(持久化到 localStorage)
+**老板拍板**:`English_expressive_narrator`(英伦男声,接近 Jarvis)。
 
 **含义**:
-- `application.yml` 配 `openclaw.tts.persona` 默认值
-- 可在前端 UI 加 persona 切换(后续,不在 M2 范围)
+- `application.yml` 配 `openclaw.tts.persona: English_expressive_narrator`
+- 前端 UI 加 persona 切换不在 M2 范围(后续迭代)
 
-### T3. STT 模型确认路径 ⏳ 待拍板
+### T3. STT 模型确认路径 ✅ 已拍板(2026-07-23 13:04)
 
-**选项**:
-- A) `/Volumes/ssd/models/sherpa-onnx/paraformer-zh-2023-09-14/`(跟系统其他模型同位置)
-- B) 项目内 `/Volumes/ssd/openclaw-voice-node/models/stt/`(跟代码一起)
-- C) `~/.cache/sherpa-onnx/`(XDG 标准)
+**老板拍板**:**B 项目内** `/Volumes/ssd/openclaw-voice-node/models/stt/`,**不推到 github**。
 
-**推荐 A**:模型放 `/Volumes/ssd/models/` 集中管理,不污染项目仓库(模型不入 git)
+**实现要点**:
+- 模型目录加入 `.gitignore`(避免误推)
+- `application.yml` 配 `openclaw.stt.model-dir: ${project.basedir}/models/stt/paraformer-zh-2023-09-14`
+- 首次开发者跑 `scripts/download-stt-model.sh` 下载模型
+- 项目部署文档需明确说明"模型文件需要手动下载"
 
 ### T4. frpc HTTPS 反代 ⏳ 推到 M3,不在 M1/M2 范围
 
@@ -625,10 +622,14 @@ async function playAudio(base64Audio: string, format = 'mp3') {
 - M3 单独做 frpc HTTPS plugin 配置(自签证书或 Let's Encrypt)
 - 不阻塞 STT/TTS 主链路开发
 
-### T5. STT 性能预期 ⏳ 老板心里有数
+### T5. STT 性能预期 ✅ 已拍板(2026-07-23 13:04)
 
-- base 模型 + 离线识别:**500ms~1s**(用户说完 → 文本出来)
-- 后续若觉得慢:升级 OnlineRecognizer 流式 + Paraformer-zh streaming 版
+**老板拍板**: **500ms~1s 可以接受**。
+
+**含义**:
+- 起步用 `OfflineRecognizer`(整段识别),不作流式优化
+- 如果将来用户反馈“需实时识别中间结果”,再考虑升 `OnlineRecognizer`
+- 评估后的占用 (Paraformer-zh INT8): 后端启动时 ~2s 加载,运行后常驻内存 ~500MB
 
 ---
 

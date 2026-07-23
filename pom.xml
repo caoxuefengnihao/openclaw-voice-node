@@ -47,6 +47,21 @@
             <groupId>com.fasterxml.jackson.core</groupId>
             <artifactId>jackson-databind</artifactId>
         </dependency>
+
+        <!-- sherpa-onnx (STT) -->
+        <!-- Java binding + Mac M1 native lib, 从 GitHub Releases 下后 mvn install:install-file 到本地仓库 -->
+        <!-- scripts/download-stt-deps.sh 负责拉这两个 jar -->
+        <dependency>
+            <groupId>com.k2fsa</groupId>
+            <artifactId>sherpa-onnx</artifactId>
+            <version>1.13.4</version>
+        </dependency>
+        <dependency>
+            <groupId>com.k2fsa</groupId>
+            <artifactId>sherpa-onnx-native</artifactId>
+            <version>1.13.4</version>
+            <classifier>osx-aarch64</classifier>
+        </dependency>
         <dependency>
             <groupId>org.projectlombok</groupId>
             <artifactId>lombok</artifactId>
