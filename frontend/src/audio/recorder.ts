@@ -27,6 +27,18 @@ export class AudioRecorder {
     this.chunkCount = 0
 
     console.log('[rec] 请求麦克风权限...')
+
+    // secure context 检查：浏览器 getUserMedia 需要 HTTPS / localhost / file://
+    // (非 secure context 下 navigator.mediaDevices 整个属性为 undefined)
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      const isSecure = window.isSecureContext
+      throw new Error(
+        '麦克风 API 不可用：当前页面不是 secure context (' +
+          (isSecure ? 'isSecureContext=true 但 mediaDevices 不存在' : 'isSecureContext=false') +
+          ')。请用 http://localhost:5174/ 或 HTTPS 访问。'
+      )
+    }
+
     this.mediaStream = await navigator.mediaDevices.getUserMedia({
       audio: {
         sampleRate: 16000,
