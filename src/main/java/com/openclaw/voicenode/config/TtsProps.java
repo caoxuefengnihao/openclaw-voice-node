@@ -18,7 +18,7 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
 @ConfigurationProperties(prefix = "openclaw.tts")
 public record TtsProps(
         String baseUrl,           // "https://api.minimaxi.com"
-        String apiKeyEnv,          // "TTS_API_KEY" (env var 名,不存明文)
+        String apiKey,            // MiniMax T2A API key (从 .env / env var / application.yml 任一读,Spring property)
         String model,              // "speech-2.8-hd"
         String voiceId,            // "English_expressive_narrator"
         String format,             // "mp3"
@@ -30,9 +30,6 @@ public record TtsProps(
     public TtsProps {
         if (baseUrl == null || baseUrl.isBlank()) {
             baseUrl = "https://api.minimaxi.com";
-        }
-        if (apiKeyEnv == null || apiKeyEnv.isBlank()) {
-            apiKeyEnv = "TTS_API_KEY";
         }
         if (model == null || model.isBlank()) {
             model = "speech-2.8-hd";

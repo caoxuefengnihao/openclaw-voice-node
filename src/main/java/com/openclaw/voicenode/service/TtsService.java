@@ -49,10 +49,10 @@ public class TtsService {
             throw new TtsException("text is empty");
         }
 
-        String apiKey = System.getenv(props.apiKeyEnv());
+        String apiKey = props.apiKey();
         if (apiKey == null || apiKey.isBlank()) {
             throw new TtsException(
-                    "env var " + props.apiKeyEnv() + " is not set (synthesize aborted)");
+                    "TTS api-key is not configured (set in .env or openclaw.tts.api-key in application.yml)");
         }
 
         long t0 = System.currentTimeMillis();
