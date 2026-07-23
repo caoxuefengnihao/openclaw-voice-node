@@ -65,6 +65,10 @@ public class ChatSessionHandle {
     private long chatSendAtMs = 0L;       // sendText() 调用时间
     private long firstDeltaAtMs = 0L;     // 第一个 assistant delta 到达时间
 
+    // 🔧 一次性守卫 — 新 gateway 同时发 lifecycle:end + chat:final 两条事件,
+    // 都会落到 emitTurnDone(),不加守卫 TTS 会播 2 次。
+    private boolean turnDoneEmitted = false;
+
     public ChatSessionHandle(WebSocketSession browser, GatewayClient gateway, String sessionKey) {
         this.browser = browser;
         this.gateway = gateway;
@@ -82,6 +86,8 @@ public class ChatSessionHandle {
         // 重置本轮 buffer + 时间打点
         assistantBuffer.setLength(0);
         chatSendAtMs = System.currentTimeMillis();
+        // 新一轮 turn 开始,重置一次性守卫
+        turnDoneEmitted = false;
         firstDeltaAtMs = 0L;
 
         log.info("📤 → Gateway chat.send: {}", text);
@@ -230,6 +236,15 @@ public class ChatSessionHandle {
     }
 
     private void emitTurnDone() {
+        // 🔧 一次性守卫:新 gateway 同时发 lifecycle:end 和 chat:final 两条事件,
+        // 不加守卫本轮 turn.done 触发 2 次 → TTS 播 2 次 (用户报"重复语音")
+        if (turnDoneEmitted) {
+            log.debug("turn.done 已发送过,忽略重复事件 (fullText={} chars)",
+                    assistantBuffer.length());
+            return;
+        }
+        turnDoneEmitted = true;
+
         String fullText = assistantBuffer.toString();  // 先抓,再 clear
         int len = fullText.length();
         assistantBuffer.setLength(0);

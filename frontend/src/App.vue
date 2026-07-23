@@ -180,18 +180,17 @@ function onKeydown(e: KeyboardEvent) {
 }
 
 // ============== WS 协议 ==============
-function connect() {
-  setStatus('connecting')
-  client = new VoiceClient()
-
-  client.on('open', () => console.log('[ws] open'))
-  client.on('ready', (msg: any) => {
+function setupClientHandlers(c: VoiceClient) {
+  // 🔧 handler 只注册一次 — 之前 connect() 每次都 client = new VoiceClient() + 注册 9 个 handler,
+  // 点"重连"按钮调多次会生成多个 VoiceClient 实例 + 累积 handler → assistant.audio 播多次。
+  c.on('open', () => console.log('[ws] open'))
+  c.on('ready', (msg: any) => {
     setStatus('ready')
     sessionId.value = msg.sessionKey || ''
     console.log('[ws] ready:', msg)
   })
 
-  client.on('assistant', (msg: any) => {
+  c.on('assistant', (msg: any) => {
     const delta = msg.text || ''
     if (!delta) return
 
@@ -215,7 +214,7 @@ function connect() {
     scrollToBottom()
   })
 
-  client.on('turn.done', () => {
+  c.on('turn.done', () => {
     console.log('[ws] turn.done')
     for (let i = messages.value.length - 1; i >= 0; i--) {
       const m = messages.value[i]
@@ -227,13 +226,13 @@ function connect() {
     setStatus('ready')
   })
 
-  client.on('error', (msg: any) => {
+  c.on('error', (msg: any) => {
     console.error('[ws] error:', msg)
     setStatus('error', String(msg?.message || msg))
   })
 
   // STT 识别结果 (来自 Java 后端 audio.end 后)
-  client.on('user.text', (msg: any) => {
+  c.on('user.text', (msg: any) => {
     const text = msg.text || ''
     if (!text || !msg.isFinal) return
     console.log('[ws] user.text:', text)
@@ -248,23 +247,32 @@ function connect() {
   })
 
   // 后端确认录音开始
-  client.on('audio.ack', (msg: any) => {
+  c.on('audio.ack', (msg: any) => {
     console.log('[ws] audio.ack:', msg)
   })
 
   // M2: 收到后端 TTS 合成的音频 → AudioContext 播放
-  client.on('assistant.audio', (msg: any) => {
+  c.on('assistant.audio', (msg: any) => {
     const audio = msg.audio
     if (!audio) return
     console.log('[ws] assistant.audio 收到', (audio.length / 4 * 3 / 1024).toFixed(1), 'KB MP3')
     playAssistantAudio(audio)
   })
 
-  client.on('close', (code: number, reason: string) => {
+  c.on('close', (code: number, reason: string) => {
     console.log('[ws] closed', code, reason)
     if (status.value !== 'error') setStatus('idle')
   })
+}
 
+function connect() {
+  setStatus('connecting')
+  if (!client) {
+    // 第一次: 建 client + 注册 handler (只一次)
+    client = new VoiceClient()
+    setupClientHandlers(client)
+  }
+  // 之后 (点"重连"按钮): client 已存在,只重建 WebSocket,handler 不重复注册
   client.connect()
 }
 
