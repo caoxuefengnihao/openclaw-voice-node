@@ -106,8 +106,8 @@ public class VoiceWebSocketHandler extends AbstractWebSocketHandler {
             }
             byte[] pcm = buf.toByteArray();
             session.getAttributes().remove(ATTR_PCM_BUFFER);
-            log.info("🎤 audio.end: {} bytes PCM ({:.1f}ms @16kHz)",
-                    pcm.length, pcm.length / 32.0);
+            log.info("🎤 audio.end: {} bytes PCM ({}ms @16kHz)",
+                    pcm.length, pcm.length / 32);
             try {
                 String text = sttService.recognize(pcm);
                 sendToBrowser(session, Map.of(
