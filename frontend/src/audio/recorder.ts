@@ -68,11 +68,6 @@ export class AudioRecorder {
     const source = this.audioContext.createMediaStreamSource(this.mediaStream)
     this.workletNode = new AudioWorkletNode(this.audioContext, 'pcm-worklet')
 
-    // 🔧 BT 麦冷启动延迟 (~250ms) — Chrome 的 BT mic audio pipeline 冷启需要 ~250ms,
-    // 之前没等的话,头 ~250ms 是静音 / 异常样本,被 STT 幻觉成 "没有没有没有"。
-    // 等 pipeline 完全起来再 connect,worklet 收到的第一帧就是真实语音。
-    await new Promise(resolve => setTimeout(resolve, 250))
-
     source.connect(this.workletNode)
 
     // AudioWorklet 每 ~100ms 推一块 Int16 PCM buffer 到主线程
@@ -105,12 +100,7 @@ export class AudioRecorder {
 
     // 通知后端结束(后端会 flush STT)
     if (this.client) {
-      // 🔧 尾部缓冲延迟 (~250ms) — Chrome BT mic 音频流松开后不会立刻释放最后那 ~200ms 缓冲,
-      // 如果立即发 audio.end,后端 STT 会丢用户最后一句的尾音。
-      // 延迟 250ms 发 audio.end,让被 capture 的尾部音频先到后端 buffer。
-      setTimeout(() => {
-        this.client?.sendCommand({ type: 'audio.end' })
-      }, 250)
+      this.client.sendCommand({ type: 'audio.end' })
     }
 
     // 释放浏览器资源
