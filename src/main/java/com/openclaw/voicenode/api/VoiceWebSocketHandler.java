@@ -91,8 +91,11 @@ public class VoiceWebSocketHandler extends AbstractWebSocketHandler {
 
                 String stream = (String) payload.get("stream");
 
-                if ("response".equals(stream)) {
-                    // LLM 响应文本切片（用 delta 不要 text，避免重复发累积）
+                if ("assistant".equals(stream) || "response".equals(stream)) {
+                    // agent event 的 LLM 响应文本切片
+                    // 老 gateway 叫 "response"，新 gateway 改成了 "assistant"（OpenClaw
+                    // 2026.7.x 起，看 src/infra/agent-events.ts 的 AgentEventStream 枚举）
+                    // 用 delta 不要 text，避免重复发累积
                     Object data = payload.get("data");
                     String text = null;
                     if (data instanceof Map<?, ?> dm) {
@@ -116,13 +119,29 @@ public class VoiceWebSocketHandler extends AbstractWebSocketHandler {
                     }
                 } else if ("done".equals(stream) || "end".equals(stream) || "complete".equals(stream)
                         || "end".equals(String.valueOf(payload.get("kind")))) {
-                    // 回复完整
-                    log.info("✅ turn done, accumulated text length: {}",
-                            session.getAttributes().get(ATTR_BUFFER) == null ? 0
-                                    : ((StringBuilder) session.getAttributes().get(ATTR_BUFFER)).length());
-                    StringBuilder buf = (StringBuilder) session.getAttributes().get(ATTR_BUFFER);
-                    if (buf != null) buf.setLength(0);
-                    sendToBrowser(session, Map.of("type", "turn.done"));
+                    // 老 gateway 的 done 信号 (向后兼容)
+                    emitTurnDone(session);
+                } else if ("lifecycle".equals(stream)) {
+                    // 新 gateway (OpenClaw 2026.7.x): agent lifecycle 结束
+                    // 看 src/agents/embedded-agent-subscribe.handlers.compaction.ts:154
+                    // emitAgentEvent({ stream: "lifecycle", data: { phase: "end", ... } })
+                    Object data = payload.get("data");
+                    String phase = null;
+                    if (data instanceof Map<?, ?> dm) {
+                        Object p = dm.get("phase");
+                        if (p instanceof String s) phase = s;
+                    }
+                    if ("end".equals(phase) || "error".equals(phase) || "stop".equals(phase)) {
+                        emitTurnDone(session);
+                    }
+                } else if ("chat".equals(eventName)) {
+                    // 新 gateway: chat 事件用 state 字段 (不是 stream)
+                    // 看 packages/gateway-protocol/src/schema/logs-chat.ts 的 ChatFinalEventSchema
+                    // state: "final" 表示一轮完成
+                    Object state = payload.get("state");
+                    if ("final".equals(state) || "aborted".equals(state) || "error".equals(state)) {
+                        emitTurnDone(session);
+                    }
                 }
                 // thinking 流不转发
             } catch (Exception e) {
@@ -171,9 +190,11 @@ public class VoiceWebSocketHandler extends AbstractWebSocketHandler {
             params.put("sessionKey", props.sessionKey());
             params.put("message", content);
             params.put("idempotencyKey", UUID.randomUUID().toString());
-            // 临时 force 不用 reasoning 模型（cto 配的 gpt-5.2 / minimax-m2.5 都开 reasoning → 思考个没完）
-            // qwen-coder-model 是代码模型不行，试 vision-model
-            params.put("model", "qwen-vision-model");
+            // cto agent 默认配的是 reasoning 模型 (gpt-5.2 / minimax-m2.5:cloud, 见
+            // /Users/caoxuefeng/.openclaw/agents/cto/agent/models.json),会无限思考不出文本。
+            // chat.send 的 thinking 字段 (schema 在 logs-chat.ts:84, 可选值 ["off","xhigh"])
+            // 透传到 LLM 层 enable_thinking=false,临时关掉当次 reasoning。
+            params.put("thinking", "off");
             gw.sendFireAndForget("chat.send", params);
         } else if ("ping".equals(type)) {
             sendToBrowser(session, Map.of("type", "pong"));
@@ -202,5 +223,17 @@ public class VoiceWebSocketHandler extends AbstractWebSocketHandler {
         } catch (Exception e) {
             log.warn("sendToBrowser 失败: {}", e.getMessage());
         }
+    }
+
+    /**
+     * 一轮回复结束的统一出口。
+     * 重置 buffer 推送 turn.done 事件，让前端状态从 thinking 回到 ready（输入框解锁）。
+     */
+    private void emitTurnDone(WebSocketSession session) {
+        StringBuilder buf = (StringBuilder) session.getAttributes().get(ATTR_BUFFER);
+        int len = buf == null ? 0 : buf.length();
+        if (buf != null) buf.setLength(0);
+        log.info("✅ turn done, accumulated text length: {}", len);
+        sendToBrowser(session, Map.of("type", "turn.done"));
     }
 }
