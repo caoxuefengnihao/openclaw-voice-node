@@ -61,6 +61,8 @@ public class KwsService {
     private final Map<String, OnlineStream> sessionStreams = new ConcurrentHashMap<>();
     /** sessionId -> 上次唤醒命中时间戳(毫秒)。cooldown 防同一句话被识别成多次唤醒 */
     private final Map<String, Long> sessionLastHitAt = new ConcurrentHashMap<>();
+    /** sessionId -> 接受过的帧数 (调试: 确认 KWS 在持续处理) */
+    private final Map<String, Long> sessionFrameCount = new ConcurrentHashMap<>();
 
     public KwsService(KwsProps props) {
         this.props = props;
@@ -204,6 +206,13 @@ public class KwsService {
             spotter.decode(stream);
         }
 
+        // 调试: 每 200 帧打一次 KWS 内部状态,看是否真的在持续处理
+        long frames = sessionFrameCount.merge(sessionId, 1L, Long::sum);
+        if (frames % 200 == 0) {
+            log.debug("🔍 KWS session={} frames={} stream_ready={}",
+                    sessionId, frames, spotter.isReady(stream));
+        }
+
         KeywordSpotterResult result = spotter.getResult(stream);
         if (!result.getKeyword().isEmpty()) {
             // 命中 -> 重置 stream + 记录冷却时间,准备下一轮监听
@@ -263,6 +272,7 @@ public class KwsService {
         sessionStreams.values().forEach(OnlineStream::release);
         sessionStreams.clear();
         sessionLastHitAt.clear();
+        sessionFrameCount.clear();
         if (spotter != null) {
             spotter.release();
             spotter = null;

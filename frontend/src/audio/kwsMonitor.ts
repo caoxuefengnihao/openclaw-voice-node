@@ -36,11 +36,13 @@ export class KwsMonitor {
     console.log('[kws-monitor] 请求麦克风权限...')
 
     // 跟 recorder.ts 一样的 mic 配置
+    // 调试: 强制 sampleRate=16000,避免 Browser 内部 resample 丢质量
     this.mediaStream = await navigator.mediaDevices.getUserMedia({
       audio: {
         channelCount: 1,
         echoCancellation: false,  // BT 耳机坑 (跟 recorder.ts 一致)
         noiseSuppression: true,
+        sampleRate: 16000,         // 强制 16kHz,避免 Browser 重采样
       },
     })
 
