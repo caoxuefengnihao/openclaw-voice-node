@@ -14,6 +14,8 @@ import jakarta.annotation.PreDestroy;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
@@ -29,10 +31,14 @@ import java.util.concurrent.ConcurrentHashMap;
  * <p>每个 WS session 对应一个 {@link OnlineStream}。检测到唤醒词后**重置 stream**,
  * 准备下一轮监听(避免重复触发同一段音频)。
  *
+ * <p>输入 PCM 格式: <b>16kHz mono Float32 little-endian</b> (4 字节/样本)。
+ * 借鉴白龙马 wake-probe.html:KWS 模型训练在 float 上,Float32 直发不做 Int16 转换。
+ * 前端 worklet pcm-worklet-kws.js 累积 1600 样本(100ms@16k)后投递一块。
+ *
  * <p>调用模式:
  * <pre>
  *   kwsService.startSession(sessionId);
- *   // 每帧 PCM 进来:
+ *   // 每帧 Float32 PCM 进来:
  *   String keyword = kwsService.acceptFrame(sessionId, pcmBytes);
  *   if (!keyword.isEmpty()) { ...唤醒命中... }
  *   // session 关闭:
@@ -63,15 +69,8 @@ public class KwsService {
     private final Map<String, Long> sessionLastHitAt = new ConcurrentHashMap<>();
     /** sessionId -> 接受过的帧数 (调试: 确认 KWS 在持续处理) */
     private final Map<String, Long> sessionFrameCount = new ConcurrentHashMap<>();
-    /** sessionId -> 累积中的 float 样本 buffer,凑够 ~500ms 才喂 acceptWaveform */
-    private final Map<String, float[]> sessionSampleBuffer = new ConcurrentHashMap<>();
-    /** sessionId -> 当前 buffer 已填的样本数 */
-    private final Map<String, Integer> sessionBufferFill = new ConcurrentHashMap<>();
-    /** 累积阈值: 500ms @16kHz = 8000 样本。
-     *  fbank frame_length=25ms / shift=10ms → 8000 样本 = 50 fbank 帧
-     *  (Zipformer chunk_size=16, left_context=64 → 至少 80 帧才 ready)。
-     *  上次 1600 样本只够 10 fbank 帧, 离 chunk_size 差 6 倍。 */
-    private static final int SAMPLES_PER_FEED = 8000;
+    /** sessionId -> 累积的 feed 次数 (调试: 算 maxAmp) */
+    private final Map<String, Long> sessionFeedCount = new ConcurrentHashMap<>();
 
     public KwsService(KwsProps props) {
         this.props = props;
@@ -180,12 +179,16 @@ public class KwsService {
     }
 
     /**
-     * 喂 PCM 帧进 KWS。返回检测到的 keyword,空字符串表示未检测到。
+     * 喂 Float32 PCM 帧进 KWS。返回检测到的 keyword,空字符串表示未检测到。
      *
      * <p>synchronized 锁住的是 spotter 实例,跟 {@link SttService#recognize} 同样的单线程模式。
      *
+     * <p>每块 Float32 PCM = 1600 样本(100ms @16kHz) = 6400 字节。
+     * 直接喂 acceptWaveform,不再做 buffer 累积 — 借鉴白龙马 wake-probe.html 的"直发"
+     * 模式,避免 500ms 延迟才看到识别结果。
+     *
      * @param sessionId WS session id
-     * @param pcmFrame  16kHz mono int16 little-endian PCM bytes
+     * @param pcmFrame  16kHz mono float32 little-endian PCM bytes (4 bytes/sample)
      * @return 唤醒词文本(如 "嗨小爱"),空字符串表示未检测到
      */
     public synchronized String acceptFrame(String sessionId, byte[] pcmFrame) {
@@ -208,61 +211,31 @@ public class KwsService {
             }
         }
 
-        float[] chunkSamples = pcm16kMonoInt16ToFloat(pcmFrame);
-
-        // 累积样本到 ~100ms 才喂 acceptWaveform (前端 256 字节/帧 < 1 个 fbank 帧,必须累积)
-        float[] buffer = sessionSampleBuffer.computeIfAbsent(sessionId, k -> new float[SAMPLES_PER_FEED * 2]);
-        int fill = sessionBufferFill.getOrDefault(sessionId, 0);
-
-        int copyLen = Math.min(chunkSamples.length, buffer.length - fill);
-        System.arraycopy(chunkSamples, 0, buffer, fill, copyLen);
-        fill += copyLen;
-
-        // 攒满或接近攒满时喂一次
-        if (fill >= SAMPLES_PER_FEED) {
-            float[] toFeed = new float[fill];
-            System.arraycopy(buffer, 0, toFeed, 0, fill);
-
-            // 调试: 算 maxAmp 看音频是否真的到了后端 (前端 maxAmp=18000 时这里应该 ~0.55)
-            float maxAbs = 0f;
-            for (int i = 0; i < toFeed.length; i++) {
-                float a = toFeed[i] < 0 ? -toFeed[i] : toFeed[i];
-                if (a > maxAbs) maxAbs = a;
-            }
-
-            stream.acceptWaveform(toFeed, 16000);  // 硬编 16kHz — 之前 props.sampleRate() 可能拿到 0/错误值
-            // 上次 sendAudio() 调用接受的是录音模型采样率,不对。KWS 必须 16kHz。
-
-            while (spotter.isReady(stream)) {
-                spotter.decode(stream);
-            }
-
-            // 调试: 每 5 次喂入打一次 (5 * ~100ms = 500ms),看音频幅度 + 关键状态
-            long feedCount = sessionLastHitAt.containsKey(sessionId + "_feed") ? 1 : 1; // placeholder
-            long feedN = (Long) sessionLastHitAt.computeIfAbsent(sessionId + "_feedCount", k -> 0L) + 1;
-            sessionLastHitAt.put(sessionId + "_feedCount", feedN);
-            if (feedN % 5 == 0) {
-                log.info("🎵 KWS feed#{} session={} samples={} maxAmp={} stream_ready={}",
-                        feedN, sessionId, toFeed.length,
-                        String.format("%.4f", maxAbs), spotter.isReady(stream));
-            }
-            // 剩余样本移位
-            int remaining = 0;
-            if (copyLen < chunkSamples.length) {
-                int leftover = chunkSamples.length - copyLen;
-                System.arraycopy(chunkSamples, copyLen, buffer, 0, leftover);
-                remaining = leftover;
-            }
-            sessionBufferFill.put(sessionId, remaining);
-        } else {
-            sessionBufferFill.put(sessionId, fill);
+        // Float32 LE bytes → float[]
+        float[] samples = pcm16kMonoFloat32BytesToFloat(pcmFrame);
+        if (samples.length == 0) {
+            return "";
         }
 
-        // 调试: 每 200 帧打一次 KWS 内部状态
-        long frames = sessionFrameCount.merge(sessionId, 1L, Long::sum);
-        if (frames % 200 == 0) {
-            log.debug("🔍 KWS session={} frames={} buffer_fill={} stream_ready={}",
-                    sessionId, frames, sessionBufferFill.getOrDefault(sessionId, 0), spotter.isReady(stream));
+        // 调试: 算 maxAmp 看音频是否真的到了后端 (Float32 范围 [-1, 1])
+        float maxAbs = 0f;
+        for (float v : samples) {
+            float a = v < 0 ? -v : v;
+            if (a > maxAbs) maxAbs = a;
+        }
+
+        stream.acceptWaveform(samples, props.sampleRate());
+
+        while (spotter.isReady(stream)) {
+            spotter.decode(stream);
+        }
+
+        // 调试: 每 10 块打一次,看音频幅度 + KWS 内部状态
+        long feedN = sessionFeedCount.merge(sessionId, 1L, Long::sum);
+        if (feedN % 10 == 0) {
+            log.info("🎵 KWS feed#{} session={} samples={} maxAmp={} stream_ready={}",
+                    feedN, sessionId, samples.length,
+                    String.format("%.4f", maxAbs), spotter.isReady(stream));
         }
 
         KeywordSpotterResult result = spotter.getResult(stream);
@@ -282,17 +255,13 @@ public class KwsService {
      *
      * @param sessionId WS session id
      */
-    /**
-     * 重置 session,清理累积 buffer 和命中时间。WebSocket 关闭时由 KwsWebSocketHandler 调。
-     */
     public synchronized void stopSession(String sessionId) {
         if (!sessionStreams.containsKey(sessionId)) return;
         OnlineStream old = sessionStreams.remove(sessionId);
         if (old != null) old.release();
         sessionLastHitAt.remove(sessionId);
         sessionFrameCount.remove(sessionId);
-        sessionSampleBuffer.remove(sessionId);
-        sessionBufferFill.remove(sessionId);
+        sessionFeedCount.remove(sessionId);
         log.info("🔥 KWS session stopped: {}", sessionId);
     }
 
@@ -331,6 +300,7 @@ public class KwsService {
         sessionStreams.clear();
         sessionLastHitAt.clear();
         sessionFrameCount.clear();
+        sessionFeedCount.clear();
         if (spotter != null) {
             spotter.release();
             spotter = null;
@@ -339,17 +309,15 @@ public class KwsService {
     }
 
     /**
-     * PCM 16kHz mono int16 little-endian -> float32 [-1.0, 1.0]
+     * Float32 LE bytes → float[] 数组。
+     * 借鉴白龙马:kws-process.cjs 直接收 Float32,Java 端只需字节序转换 + 拷一份。
      */
-    private static float[] pcm16kMonoInt16ToFloat(byte[] pcm) {
-        int n = pcm.length / 2;
+    private static float[] pcm16kMonoFloat32BytesToFloat(byte[] pcm) {
+        int n = pcm.length / 4;
+        if (n == 0) return new float[0];
         float[] out = new float[n];
-        for (int i = 0; i < n; i++) {
-            short s = (short) ((pcm[2 * i] & 0xff) | ((pcm[2 * i + 1] & 0xff) << 8));
-            out[i] = s / 32768f;
-        }
-        // 调试: 第一次调 + 每 500 次打一次"后端实际解析的样本"前 4 个
-        // 跟 KwsWebSocketHandler 的 raw bytes 对比
+        // ByteBuffer 默认 BE,显式切 LE 跟前端 Float32Array 一致
+        ByteBuffer.wrap(pcm).order(ByteOrder.LITTLE_ENDIAN).asFloatBuffer().get(out);
         return out;
     }
 }

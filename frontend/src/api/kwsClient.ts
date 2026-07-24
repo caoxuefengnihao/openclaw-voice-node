@@ -1,6 +1,10 @@
 // kwsClient.ts -- KWS 唤醒词专用 WebSocket 客户端 (v3 新增)
 // 跟现有 VoiceClient 平行,连 /ws/kws 而不是 /ws/audio
 // 完全独立,不修改任何现有文件
+//
+// 改动 (2026-07-25): PCM 格式从 Int16 改成 Float32 (直接发,不做 Int16 转换)
+//   理由: KWS 模型在 float 上训练,Float32→Int16 会引入量化噪声
+//   借鉴白龙马 wake-probe.html + voice-core.js 的 Float32 直发模式
 
 type Handler = (...args: any[]) => void
 
@@ -34,8 +38,9 @@ export class KwsClient {
     }
   }
 
-  /** 发 PCM 二进制帧 (16kHz mono int16 LE) */
-  sendAudio(pcm: Int16Array): void {
+  /** 发 Float32 PCM 二进制帧 (16kHz mono float32 LE,4 字节/样本)。
+   *  借鉴白龙马:KWS 模型在 float 上训练,不做 Int16 转换。 */
+  sendAudio(pcm: Float32Array): void {
     if (this.ws?.readyState === WebSocket.OPEN) {
       this.ws.send(pcm.buffer)
     }

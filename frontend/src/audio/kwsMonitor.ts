@@ -2,10 +2,14 @@
 // 跟现有 AudioRecorder 平行,但:
 // 1. 页面打开即启 (不需要点按钮)
 // 2. 连 /ws/kws (不是 /ws/audio)
-// 3. 持续发 audio.chunk,后端 KWS 每帧检测
+// 3. 持续发 Float32 PCM,后端 KWS 每帧检测
 // 4. 收到 wake.detected -> 前端切到 audio.start 录音模式
 //
-// 复用现有 /audio/pcm-worklet.js (同一个 AudioWorklet 模块)
+// 用独立的 /audio/pcm-worklet-kws.js (Float32 输出,1600 样本/块 = 100ms@16k),
+// 不复用 STT 的 Int16 worklet。理由:
+//   - KWS 模型训练在 float 上,Float32→Int16 转换会引入量化噪声
+//   - 白龙马 wake-probe.html 也是 Float32 直发
+//   - 改 STT worklet 会破坏 recorder.ts,得不偿失
 
 import type { KwsClient } from '../api/kwsClient'
 
@@ -35,14 +39,19 @@ export class KwsMonitor {
 
     console.log('[kws-monitor] 请求麦克风权限...')
 
-    // 跟 recorder.ts 一样的 mic 配置
-    // 调试: 强制 sampleRate=16000,避免 Browser 内部 resample 丢质量
+    // 借鉴白龙马 wake-probe.html:
+    //   KWS 要原始音频,所有浏览器音频处理全关
+    //   - 模型训练在干净音频上,AEC/NS/AGC 都会扭曲语音、害识别
+    //   - 白龙马注释直说: "样本能 100% 命中正因为干净"
+    // 之前 voice-node 是 echoCancellation:false + noiseSuppression:true,
+    // 这次统一关掉 noiseSuppression + autoGainControl。
     this.mediaStream = await navigator.mediaDevices.getUserMedia({
       audio: {
         channelCount: 1,
-        echoCancellation: false,  // BT 耳机坑 (跟 recorder.ts 一致)
-        noiseSuppression: true,
-        sampleRate: 16000,         // 强制 16kHz,避免 Browser 重采样
+        echoCancellation: false,    // BT 耳机坑 + KWS 都要关
+        noiseSuppression: false,    // 借鉴白龙马 — KWS 必须关
+        autoGainControl: false,     // 借鉴白龙马 — KWS 必须关
+        sampleRate: 16000,          // 强制 16kHz,避免 Browser 重采样
       },
     })
 
@@ -53,24 +62,28 @@ export class KwsMonitor {
         'label="' + track.label + '"')
 
     this.audioContext = new AudioContext({ sampleRate: 16000 })
-    await this.audioContext.audioWorklet.addModule('/audio/pcm-worklet.js')
+    // 用 KWS 专用 Float32 worklet (1600 样本/块 ≈ 100ms @16k)
+    // 不要 addModule('/audio/pcm-worklet.js') — 那是 Int16 的,给 STT 用
+    await this.audioContext.audioWorklet.addModule('/audio/pcm-worklet-kws.js')
     const source = this.audioContext.createMediaStreamSource(this.mediaStream)
-    this.workletNode = new AudioWorkletNode(this.audioContext, 'pcm-worklet')
+    this.workletNode = new AudioWorkletNode(this.audioContext, 'pcm-worklet-kws', {
+      processorOptions: { chunk: 1600 },
+    })
 
     source.connect(this.workletNode)
 
-    // AudioWorklet 每 ~100ms 推 PCM,直接发 KWS 客户端 (后端逐帧过 KwsService)
+    // AudioWorklet 每 ~100ms 推 Float32 PCM,直接发 KWS 客户端 (后端逐帧过 KwsService)
     this.workletNode.port.onmessage = (e: MessageEvent<ArrayBuffer>) => {
       if (this.client) {
-        const pcm = new Int16Array(e.data)
-        // 调试: 每 10 块打 maxAmp,看 mic 是否实际拾到音频
+        const pcm = new Float32Array(e.data)
+        // 调试: 每 10 块打 maxAmp,看 mic 是否实际拾到音频 (Float32 范围 [-1, 1])
         if (this.chunkCount % 10 === 0) {
           let maxAmp = 0
           for (let i = 0; i < pcm.length; i++) {
             const abs = pcm[i] < 0 ? -pcm[i] : pcm[i]
             if (abs > maxAmp) maxAmp = abs
           }
-          console.log(`[kws-monitor] chunk=${this.chunkCount} maxAmp=${maxAmp}/32767`)
+          console.log(`[kws-monitor] chunk=${this.chunkCount} samples=${pcm.length} maxAmp=${maxAmp.toFixed(4)}/1.0`)
         }
         this.client.sendAudio(pcm)
         this.chunkCount++
