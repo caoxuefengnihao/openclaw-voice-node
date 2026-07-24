@@ -1,5 +1,6 @@
 import { defineConfig } from 'vite'
 import vue from '@vitejs/plugin-vue'
+import { resolve } from 'path'
 
 // 默认前端 5174 / 后端 8090，避免与已有项目（5173 / 8080）冲突
 // 可用环境变量覆盖：FRONTEND_PORT=xxxx BACKEND_PORT=xxxx
@@ -21,6 +22,15 @@ export default defineConfig({
       '/api': {
         target: `http://localhost:${backendPort}`,
         changeOrigin: true,
+      },
+    },
+  },
+  build: {
+    // v3 多页入口: 原 index.html (App.vue /ws/audio) + 新 kws.html (KwsPage.vue /ws/kws)
+    rollupOptions: {
+      input: {
+        main: resolve(__dirname, 'index.html'),
+        kws: resolve(__dirname, 'kws.html'),
       },
     },
   },
