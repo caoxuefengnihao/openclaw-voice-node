@@ -22,18 +22,25 @@ MODELS_DIR="${PROJECT_ROOT}/models/kws"
 # KWS 模型候选 URL (按发布日期)
 # sherpa-onnx 团队会不定期更新 wenet encoder,这里列已知可用版本
 KWS_MODEL_URLS=(
+    # zipformer-wenetspeech 3.3M (2024-01-01) — 用户验证可下,精度高
+    "https://github.com/k2-fsa/sherpa-onnx/releases/download/kws-models/sherpa-onnx-kws-zipformer-wenetspeech-3.3M-2024-01-01.tar.bz2"
+    # 备选 1: kws-models tag 下其他模型
+    "https://github.com/k2-fsa/sherpa-onnx/releases/download/kws-models/sherpa-onnx-kws-zh-wenet-20240117.tar.bz2"
+    # 备选 2: asr-models tag 下 wenet 版本
     "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-kws-zh-wenet-20240117.tar.bz2"
-    "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-kws-zh-wenet-20240119.tar.bz2"
-    "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-kws-zh-wenet.tar.bz2"
 )
 
 # ===== 1. 创建目录 =====
 mkdir -p "${MODELS_DIR}"
 
 # ===== 2. 跳过已存在 =====
-if [[ -f "${MODELS_DIR}/encoder.onnx" && -f "${MODELS_DIR}/tokens.txt" && -f "${MODELS_DIR}/keywords.txt" ]]; then
+if [[ -f "${MODELS_DIR}/encoder-epoch-99-avg-1-chunk-16-left-64.int8.onnx" \
+   && -f "${MODELS_DIR}/tokens.txt" \
+   && -f "${MODELS_DIR}/keywords.txt" ]]; then
     echo "✅ KWS 模型已存在,跳过下载"
-    ls -lh "${MODELS_DIR}/encoder.onnx" "${MODELS_DIR}/tokens.txt" "${MODELS_DIR}/keywords.txt"
+    ls -lh "${MODELS_DIR}/encoder-epoch-99-avg-1-chunk-16-left-64.int8.onnx" \
+           "${MODELS_DIR}/tokens.txt" \
+           "${MODELS_DIR}/keywords.txt"
     exit 0
 fi
 
@@ -77,7 +84,7 @@ tar -xjf "${downloaded}" -C "${MODELS_DIR}" --strip-components=1 2>&1 | head -5 
 # ===== 5. 验证关键文件 =====
 echo ""
 echo "🔍 验证模型文件:"
-for f in encoder.onnx tokens.txt keywords.txt; do
+for f in encoder-epoch-99-avg-1-chunk-16-left-64.int8.onnx decoder-epoch-99-avg-1-chunk-16-left-64.int8.onnx joiner-epoch-99-avg-1-chunk-16-left-64.int8.onnx tokens.txt keywords.txt; do
     if [[ -f "${MODELS_DIR}/${f}" ]]; then
         size=$(stat -f%z "${MODELS_DIR}/${f}" 2>/dev/null || stat -c%s "${MODELS_DIR}/${f}" 2>/dev/null)
         echo "   ✅ ${f} (${size} bytes)"

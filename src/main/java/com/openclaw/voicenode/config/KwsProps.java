@@ -29,7 +29,9 @@ public record KwsProps(
 ) {
     public KwsProps {
         if (modelDir == null || modelDir.isBlank()) {
-            modelDir = "${project.basedir}/models/kws";
+            // 用 ${user.dir} 而非 ${project.basedir},因为后者是 Maven resource-filter 占位符,
+            // 运行时不会被 Spring 展开 (跟 STT 配置同理)
+            modelDir = "${user.dir}/models/kws";
         }
         if (numThreads <= 0) {
             numThreads = 1;

@@ -6,7 +6,7 @@ import com.k2fsa.sherpa.onnx.KeywordSpotterConfig;
 import com.k2fsa.sherpa.onnx.KeywordSpotterResult;
 import com.k2fsa.sherpa.onnx.OnlineModelConfig;
 import com.k2fsa.sherpa.onnx.OnlineStream;
-import com.k2fsa.sherpa.onnx.OnlineZipformer2CtcModelConfig;
+import com.k2fsa.sherpa.onnx.OnlineTransducerModelConfig;
 import com.openclaw.voicenode.config.KwsProps;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
@@ -48,6 +48,12 @@ public class KwsService {
     private KeywordSpotter spotter;
 
     /**
+     * 模型文件名前缀(epoch-99-avg-1,INT8 量化版,最小、默认最稳)。
+     * <p>目录里还有 epoch-12-avg-2 的备用版本,需要可改成 "epoch-12-avg-2-chunk-16-left-64"。
+     */
+    private static final String MODEL_PREFIX = "epoch-99-avg-1-chunk-16-left-64";
+
+    /**
      * sessionId -> OnlineStream
      * <p>ConcurrentHashMap 因为每个 session 独立 start/stop,acceptFrame 走 synchronized。
      */
@@ -64,21 +70,26 @@ public class KwsService {
             return;
         }
 
-        Path encoderPath = Paths.get(props.modelDir(), "encoder.onnx");
+        Path encoderPath = Paths.get(props.modelDir(), "encoder-" + MODEL_PREFIX + ".int8.onnx");
+        Path decoderPath = Paths.get(props.modelDir(), "decoder-" + MODEL_PREFIX + ".int8.onnx");
+        Path joinerPath = Paths.get(props.modelDir(), "joiner-" + MODEL_PREFIX + ".int8.onnx");
         Path tokensPath = Paths.get(props.modelDir(), "tokens.txt");
         Path keywordsPath = Paths.get(props.modelDir(), "keywords.txt");
 
-        if (!Files.exists(encoderPath) || !Files.exists(tokensPath) || !Files.exists(keywordsPath)) {
+        if (!Files.exists(encoderPath) || !Files.exists(decoderPath) || !Files.exists(joinerPath)
+                || !Files.exists(tokensPath) || !Files.exists(keywordsPath)) {
             throw new IllegalStateException(
                     "KWS 模型文件不存在:\n"
                             + "  " + encoderPath + "\n"
+                            + "  " + decoderPath + "\n"
+                            + "  " + joinerPath + "\n"
                             + "  " + tokensPath + "\n"
                             + "  " + keywordsPath + "\n"
                             + "请先跑: ./scripts/download-kws-deps.sh");
         }
 
-        log.info("🔥 加载 KWS 模型: modelDir={}, numThreads={}, threshold={}",
-                props.modelDir(), props.numThreads(), props.threshold());
+        log.info("🔥 加载 KWS 模型: modelDir={}, numThreads={}, threshold={}, prefix={}",
+                props.modelDir(), props.numThreads(), props.threshold(), MODEL_PREFIX);
 
         long t0 = System.currentTimeMillis();
 
@@ -87,9 +98,12 @@ public class KwsService {
                 .setFeatureDim(80)
                 .build();
 
+        // 模型架构:zipformer transducer (encoder + decoder + joiner),不是 CTC
         OnlineModelConfig modelConfig = OnlineModelConfig.builder()
-                .setZipformer2Ctc(OnlineZipformer2CtcModelConfig.builder()
-                        .setModel(encoderPath.toString())
+                .setTransducer(OnlineTransducerModelConfig.builder()
+                        .setEncoder(encoderPath.toString())
+                        .setDecoder(decoderPath.toString())
+                        .setJoiner(joinerPath.toString())
                         .build())
                 .setTokens(tokensPath.toString())
                 .setNumThreads(props.numThreads())

@@ -8,10 +8,11 @@
 #   SPRING_PROFILES_ACTIVE=kws
 
 kws:
-  # KWS 模型目录 (encoder.onnx + tokens.txt + keywords.txt)
-  # 默认: ${project.basedir}/models/kws
+  # KWS 模型目录 (encoder.onnx + decoder.onnx + joiner.onnx + tokens.txt + keywords.txt)
+  # 默认: ${user.dir}/models/kws (用 user.dir 而非 project.basedir,因为后者是 Maven
+  # resource-filter 占位符,运行时不会被 Spring 展开 — 跟 STT 配置同理)
   # 跑 ./scripts/download-kws-deps.sh 下模型
-  model-dir: ${project.basedir}/models/kws
+  model-dir: ${user.dir}/models/kws
 
   # sherpa-onnx KeywordSpotter 推理 CPU 线程数
   # KWS 模型轻量,1 线程够用;跟 STT 共用 CPU 资源
