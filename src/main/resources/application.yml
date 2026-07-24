@@ -53,12 +53,16 @@ openclaw:
   # 复用同一个 sherpa-onnx JVM jar + native lib（已在 STT 装过）
   # 模型：sherpa-onnx-kws-zipformer-wenetspeech-3.3M (transducer 架构: encoder + decoder + joiner)
   # 下模型：./scripts/download-kws-deps.sh
+  # 预训练 8 关键词 transducer (encoder + decoder + joiner 三件套)
+  # 自训练 CTC 备件在 models/kws-jiavs/ (sherpa-onnx 1.13.4 KeywordSpotter 暂不支持 CTC,先留着)
   kws:
     model-dir: ${user.dir}/models/kws
     num-threads: 1
     sample-rate: 16000
     threshold: 0.6       # 唤醒阈值 0.1~0.9,0.6 是默认值
     enabled: true        # 紧急关闭 KWS (设 false 后 KwsService.init() 跳过加载)
+    use-ctc: false       # true = CTC (自训练 wake word, 需 sherpa-onnx 升级支持)
+                         # false = Transducer (预训练 8 关键词, 当前生效)
 
 talk:
   # 默认 mode = stt-tts + managed-room（不依赖 OpenAI Realtime 账号）

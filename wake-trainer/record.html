@@ -1,0 +1,361 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>唤醒词录音 · jiavs</title>
+  <style>
+    body {
+      max-width: 720px;
+      margin: 40px auto;
+      padding: 24px;
+      font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+      background: #fafafa;
+      color: #222;
+    }
+    h1 { font-size: 22px; margin-bottom: 8px; }
+    .kw { color: #007aff; font-weight: 600; font-size: 28px; padding: 4px 12px; background: #e8f4ff; border-radius: 8px; }
+    .status { padding: 16px; border-radius: 8px; background: #fff; border: 1px solid #e0e0e0; margin: 16px 0; font-size: 14px; }
+    .status.recording { background: #ffe8e8; border-color: #ff3b30; }
+    .status.paused { background: #fff4e8; border-color: #ff9500; }
+    .status.done { background: #e8f4ff; border-color: #007aff; }
+    .progress { font-size: 48px; font-weight: 600; text-align: center; margin: 24px 0; font-variant-numeric: tabular-nums; }
+    .progress span.total { color: #999; font-size: 32px; }
+    .controls { display: flex; gap: 12px; justify-content: center; margin: 24px 0; }
+    button {
+      padding: 14px 28px;
+      font-size: 16px;
+      font-weight: 600;
+      border: none;
+      border-radius: 8px;
+      cursor: pointer;
+      transition: all 0.15s;
+    }
+    button.primary { background: #007aff; color: white; }
+    button.primary:hover { background: #0051d5; }
+    button.danger { background: #ff3b30; color: white; }
+    button.success { background: #34c759; color: white; }
+    button:disabled { background: #ccc; cursor: not-allowed; }
+    .timer { font-size: 72px; font-weight: 700; text-align: center; color: #ff3b30; font-variant-numeric: tabular-nums; min-height: 80px; line-height: 80px; }
+    .timer.idle { color: #999; font-size: 32px; min-height: 40px; line-height: 40px; }
+    .tip { padding: 12px 16px; background: #fffbe6; border: 1px solid #ffe58f; border-radius: 8px; font-size: 13px; color: #614700; margin: 12px 0; }
+    .log { font-family: monospace; font-size: 12px; max-height: 200px; overflow-y: auto; background: #1e1e1e; color: #ddd; padding: 12px; border-radius: 8px; margin-top: 16px; }
+    .log div { padding: 2px 0; }
+    .log .err { color: #ff6b6b; }
+    .log .ok { color: #51cf66; }
+  </style>
+</head>
+<body>
+  <h1>🎙️ 唤醒词录音</h1>
+  <div style="margin-bottom: 16px;">
+    关键词: <span class="kw" id="kw"></span>
+    <span style="margin-left: 16px; color: #666; font-size: 14px;">目标 100 次</span>
+  </div>
+
+  <div class="tip">
+    💡 <b>录音技巧</b>: 距离 mic 20-30cm,正常说话速度,清晰但不必字正腔圆。<br>
+    录 1.5 秒 → 自动停 → 间隔 1 秒准备 → 录下一个,完全自动连续。<br>
+    ⚠️ 全程用同一个 mic (你的 BT 麦),保持训练数据跟实际使用一致。
+  </div>
+
+  <div class="status idle" id="status">准备就绪</div>
+
+  <div class="progress">
+    <span id="count">0</span> <span class="total">/ 100</span>
+  </div>
+
+  <div class="timer idle" id="timer">--</div>
+
+  <div class="controls">
+    <button class="primary" id="btnStart" onclick="startRecording()">开始录音</button>
+    <button class="danger" id="btnPause" onclick="togglePause()" disabled>暂停</button>
+    <button class="success" id="btnDownload" onclick="downloadAll()" disabled>下载 zip</button>
+    <button class="success" id="btnDownloadIndividual" onclick="downloadIndividual()" disabled style="background:#ff9500">逐个下载 (zip 卡了用)</button>
+  </div>
+
+  <div class="log" id="log"></div>
+
+  <script src="jszip.min.js"></script>
+  <script>
+    const TARGET_COUNT = 100;
+    const RECORD_DURATION_MS = 1500;   // 每次录 1.5 秒
+    const GAP_DURATION_MS = 1000;      // 间隔 1 秒
+    const SAMPLE_RATE = 16000;
+
+    // URL 参数: ?keyword=jiavs (默认 jiavs)
+    const KEYWORD = new URLSearchParams(location.search).get('keyword') || 'jiavs';
+    document.getElementById('kw').textContent = KEYWORD;
+
+    let mediaStream = null;
+    let audioContext = null;
+    let scriptProcessor = null;
+    let isRecording = false;
+    let isPaused = false;
+    let recordedCount = 0;
+    let currentBuffer = [];
+    let allRecordings = []; // [{name, samples: Int16Array}]
+
+    const $status = document.getElementById('status');
+    const $count = document.getElementById('count');
+    const $timer = document.getElementById('timer');
+    const $btnStart = document.getElementById('btnStart');
+    const $btnPause = document.getElementById('btnPause');
+    const $btnDownload = document.getElementById('btnDownload');
+    const $log = document.getElementById('log');
+
+    function log(msg, cls = '') {
+      const div = document.createElement('div');
+      div.textContent = msg;
+      if (cls) div.className = cls;
+      $log.appendChild(div);
+      $log.scrollTop = $log.scrollHeight;
+    }
+
+    function setStatus(text, cls = '') {
+      $status.textContent = text;
+      $status.className = 'status ' + cls;
+    }
+
+    function updateCount() {
+      $count.textContent = recordedCount;
+      if (recordedCount >= TARGET_COUNT) {
+        finishRecording();
+      }
+    }
+
+    async function startRecording() {
+      try {
+        $btnStart.disabled = true;
+        setStatus('请求麦克风权限...');
+        log('🎤 请求麦克风权限 (用你 BT 麦)');
+
+        // BT 麦坑: echoCancellation=false
+        mediaStream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            channelCount: 1,
+            echoCancellation: false,
+            noiseSuppression: true,
+            sampleRate: SAMPLE_RATE,
+          },
+        });
+
+        audioContext = new AudioContext({ sampleRate: SAMPLE_RATE });
+        const source = audioContext.createMediaStreamSource(mediaStream);
+
+        // 用 ScriptProcessor 拿原始 PCM (Browser 不支持直接 sampleRate, 但能 resample)
+        // bufferSize=4096 @ 16kHz ≈ 256ms 延迟
+        scriptProcessor = audioContext.createScriptProcessor(4096, 1, 1);
+        source.connect(scriptProcessor);
+        scriptProcessor.connect(audioContext.destination);
+        scriptProcessor.onaudioprocess = (e) => {
+          if (!isRecording || isPaused) return;
+          const input = e.inputBuffer.getChannelData(0);
+          // 复制 samples
+          const chunk = new Float32Array(input.length);
+          chunk.set(input);
+          currentBuffer.push(...chunk);
+        };
+
+        log('✅ 麦克风已连接', 'ok');
+        log(`🎧 AudioContext sampleRate: ${audioContext.sampleRate}`);
+
+        // 1 秒准备时间
+        setStatus('准备中... (说 "jiavs" 准备好)', 'paused');
+        await sleep(1000);
+
+        isRecording = true;
+        isPaused = false;
+        $btnPause.disabled = false;
+        setStatus('录音中', 'recording');
+        log('🔴 开始自动录音循环');
+
+        runLoop();
+
+      } catch (e) {
+        log(`❌ 启动失败: ${e.message}`, 'err');
+        setStatus('错误: ' + e.message);
+        $btnStart.disabled = false;
+      }
+    }
+
+    async function runLoop() {
+      while (isRecording && recordedCount < TARGET_COUNT) {
+        if (isPaused) {
+          await sleep(200);
+          continue;
+        }
+
+        // 录音阶段
+        currentBuffer = [];
+        setStatus(`第 ${recordedCount + 1} 次: 说话!`, 'recording');
+        let elapsed = 0;
+        const recordStart = Date.now();
+        while (elapsed < RECORD_DURATION_MS && !isPaused && isRecording) {
+          const remaining = Math.max(0, RECORD_DURATION_MS - elapsed);
+          $timer.textContent = (remaining / 1000).toFixed(1);
+          await sleep(50);
+          elapsed = Date.now() - recordStart;
+        }
+        $timer.textContent = '';
+
+        if (!isRecording || isPaused) {
+          if (isPaused) {
+            log('⏸  录音暂停中');
+            setStatus('已暂停', 'paused');
+            while (isPaused && isRecording) await sleep(200);
+            if (!isRecording) return;
+            log('▶ 继续录音');
+            setStatus('录音中', 'recording');
+            continue;
+          } else {
+            return;
+          }
+        }
+
+        // 保存本次录音
+        const samples = new Int16Array(currentBuffer.length);
+        for (let i = 0; i < currentBuffer.length; i++) {
+          let s = Math.max(-1, Math.min(1, currentBuffer[i]));
+          samples[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+        }
+        const name = `${String(recordedCount + 1).padStart(3, '0')}_${KEYWORD}.wav`;
+        allRecordings.push({ name, samples });
+        recordedCount++;
+        updateCount();
+        log(`✅ ${name} (${(samples.length / SAMPLE_RATE).toFixed(2)}s, ${samples.length} samples)`, 'ok');
+
+        // 间隔
+        if (recordedCount < TARGET_COUNT) {
+          setStatus(`第 ${recordedCount + 1} 次: 准备 (说 "jiavs")`, 'paused');
+          await sleep(GAP_DURATION_MS);
+        }
+      }
+      finishRecording();
+    }
+
+    function togglePause() {
+      isPaused = !isPaused;
+      $btnPause.textContent = isPaused ? '继续' : '暂停';
+      if (isPaused) {
+        setStatus('已暂停', 'paused');
+        log('⏸  暂停');
+      } else {
+        setStatus('录音中', 'recording');
+        log('▶ 继续');
+      }
+    }
+
+    function finishRecording() {
+      isRecording = false;
+      if (scriptProcessor) {
+        scriptProcessor.disconnect();
+        scriptProcessor.onaudioprocess = null;
+      }
+      if (mediaStream) {
+        mediaStream.getTracks().forEach(t => t.stop());
+      }
+      if (audioContext) {
+        audioContext.close();
+      }
+      setStatus(`✅ 完成! 录了 ${recordedCount} 次`, 'done');
+      $timer.classList.add('idle');
+      $timer.textContent = '✓';
+      $btnPause.disabled = true;
+      $btnDownload.disabled = false;
+      $btnStart.disabled = false;
+      log(`🎉 全部完成! 点 "下载 zip" 拿录音文件`, 'ok');
+    }
+
+    function samplesToWavBlob(int16Samples, sampleRate) {
+      const dataLen = int16Samples.length * 2;
+      const buf = new ArrayBuffer(44 + dataLen);
+      const view = new DataView(buf);
+
+      // RIFF header
+      writeStr(view, 0, 'RIFF');
+      view.setUint32(4, 36 + dataLen, true);
+      writeStr(view, 8, 'WAVE');
+      // fmt chunk
+      writeStr(view, 12, 'fmt ');
+      view.setUint32(16, 16, true);    // chunk size
+      view.setUint16(20, 1, true);      // PCM
+      view.setUint16(22, 1, true);      // mono
+      view.setUint32(24, sampleRate, true);
+      view.setUint32(28, sampleRate * 2, true);  // byte rate
+      view.setUint16(32, 2, true);      // block align
+      view.setUint16(34, 16, true);     // bits per sample
+      // data chunk
+      writeStr(view, 36, 'data');
+      view.setUint32(40, dataLen, true);
+      // samples
+      const offset = 44;
+      for (let i = 0; i < int16Samples.length; i++) {
+        view.setInt16(offset + i * 2, int16Samples[i], true);
+      }
+      return new Blob([buf], { type: 'audio/wav' });
+    }
+
+    function writeStr(view, offset, str) {
+      for (let i = 0; i < str.length; i++) {
+        view.setUint8(offset + i, str.charCodeAt(i));
+      }
+    }
+
+    async function downloadAll() {
+      log('📦 打包 zip...');
+      if (typeof JSZip === 'undefined') {
+        log('❌ JSZip 未加载, 请用"逐个下载"按钮', 'err');
+        return;
+      }
+
+      const zip = new JSZip();
+      for (const rec of allRecordings) {
+        const blob = samplesToWavBlob(rec.samples, SAMPLE_RATE);
+        zip.file(rec.name, blob);
+      }
+
+      const content = await zip.generateAsync({ type: 'blob' });
+      const url = URL.createObjectURL(content);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `jiavs_recordings_${Date.now()}.zip`;
+      a.click();
+      URL.revokeObjectURL(url);
+      log('✅ zip 已下载', 'ok');
+    }
+
+    /**
+     * 逐个下载:不走 zip,逐个触发 <a download>,不依赖 JSZip
+     * 浏览器默认会连续下载 100 个 wav 到下载目录
+     * Chrome 第一次会弹个"允许下载多个文件"的对话框,点允许
+     */
+    function downloadIndividual() {
+      log('📦 逐个下载 ' + allRecordings.length + ' 个文件...');
+      let i = 0;
+      const next = () => {
+        if (i >= allRecordings.length) {
+          log('✅ 全部触发完成', 'ok');
+          return;
+        }
+        const rec = allRecordings[i++];
+        const blob = samplesToWavBlob(rec.samples, SAMPLE_RATE);
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = rec.name;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+        // 错开触发避免浏览器拦截
+        setTimeout(next, 150);
+      };
+      next();
+    }
+
+    function sleep(ms) {
+      return new Promise(r => setTimeout(r, ms));
+    }
+  </script>
+</body>
+</html>

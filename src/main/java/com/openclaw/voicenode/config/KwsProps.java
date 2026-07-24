@@ -25,7 +25,13 @@ public record KwsProps(
         int numThreads,
         int sampleRate,
         float threshold,
-        boolean enabled
+        boolean enabled,
+        /**
+         * 使用自训练 CTC 模型（仅 1 个 encoder.onnx）。
+         * true: 期望 encoder.onnx + tokens.txt + keywords.txt (CTC 模式)
+         * false (默认): 期望 encoder/decoder/joiner + tokens.txt + keywords.txt (transducer 模式)
+         */
+        boolean useCtc
 ) {
     public KwsProps {
         if (modelDir == null || modelDir.isBlank()) {

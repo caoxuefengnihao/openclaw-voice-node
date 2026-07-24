@@ -7,6 +7,7 @@ import com.k2fsa.sherpa.onnx.KeywordSpotterResult;
 import com.k2fsa.sherpa.onnx.OnlineModelConfig;
 import com.k2fsa.sherpa.onnx.OnlineStream;
 import com.k2fsa.sherpa.onnx.OnlineTransducerModelConfig;
+import com.k2fsa.sherpa.onnx.OnlineZipformer2CtcModelConfig;
 import com.openclaw.voicenode.config.KwsProps;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
@@ -70,26 +71,21 @@ public class KwsService {
             return;
         }
 
-        Path encoderPath = Paths.get(props.modelDir(), "encoder-" + MODEL_PREFIX + ".int8.onnx");
-        Path decoderPath = Paths.get(props.modelDir(), "decoder-" + MODEL_PREFIX + ".int8.onnx");
-        Path joinerPath = Paths.get(props.modelDir(), "joiner-" + MODEL_PREFIX + ".int8.onnx");
         Path tokensPath = Paths.get(props.modelDir(), "tokens.txt");
         Path keywordsPath = Paths.get(props.modelDir(), "keywords.txt");
 
-        if (!Files.exists(encoderPath) || !Files.exists(decoderPath) || !Files.exists(joinerPath)
-                || !Files.exists(tokensPath) || !Files.exists(keywordsPath)) {
+        if (!Files.exists(tokensPath) || !Files.exists(keywordsPath)) {
             throw new IllegalStateException(
-                    "KWS 模型文件不存在:\n"
-                            + "  " + encoderPath + "\n"
-                            + "  " + decoderPath + "\n"
-                            + "  " + joinerPath + "\n"
+                    "KWS 必备文件不存在:\n"
                             + "  " + tokensPath + "\n"
                             + "  " + keywordsPath + "\n"
-                            + "请先跑: ./scripts/download-kws-deps.sh");
+                            + "请检查 modelDir 配置");
         }
 
-        log.info("🔥 加载 KWS 模型: modelDir={}, numThreads={}, threshold={}, prefix={}",
-                props.modelDir(), props.numThreads(), props.threshold(), MODEL_PREFIX);
+        log.info("🔥 加载 KWS 模型: modelDir={}, mode={}, numThreads={}, threshold={}",
+                props.modelDir(),
+                props.useCtc() ? "CTC" : "Transducer",
+                props.numThreads(), props.threshold());
 
         long t0 = System.currentTimeMillis();
 
@@ -98,16 +94,45 @@ public class KwsService {
                 .setFeatureDim(80)
                 .build();
 
-        // 模型架构:zipformer transducer (encoder + decoder + joiner),不是 CTC
-        OnlineModelConfig modelConfig = OnlineModelConfig.builder()
-                .setTransducer(OnlineTransducerModelConfig.builder()
-                        .setEncoder(encoderPath.toString())
-                        .setDecoder(decoderPath.toString())
-                        .setJoiner(joinerPath.toString())
-                        .build())
-                .setTokens(tokensPath.toString())
-                .setNumThreads(props.numThreads())
-                .build();
+        OnlineModelConfig modelConfig;
+        if (props.useCtc()) {
+            // CTC 模式: 仅 1 个 encoder.onnx (自训练 wake word 模型)
+            Path encoderPath = Paths.get(props.modelDir(), "encoder.onnx");
+            if (!Files.exists(encoderPath)) {
+                throw new IllegalStateException(
+                        "CTC 模式需要 encoder.onnx, 但不存在: " + encoderPath + "\n"
+                                + "请训练或拷贝自训练模型到 modelDir");
+            }
+            modelConfig = OnlineModelConfig.builder()
+                    .setZipformer2Ctc(OnlineZipformer2CtcModelConfig.builder()
+                            .setModel(encoderPath.toString())
+                            .build())
+                    .setTokens(tokensPath.toString())
+                    .setNumThreads(props.numThreads())
+                    .build();
+        } else {
+            // Transducer 模式: encoder + decoder + joiner (预训练 8 关键词模型)
+            Path encoderPath = Paths.get(props.modelDir(), "encoder-" + MODEL_PREFIX + ".int8.onnx");
+            Path decoderPath = Paths.get(props.modelDir(), "decoder-" + MODEL_PREFIX + ".int8.onnx");
+            Path joinerPath = Paths.get(props.modelDir(), "joiner-" + MODEL_PREFIX + ".int8.onnx");
+            if (!Files.exists(encoderPath) || !Files.exists(decoderPath) || !Files.exists(joinerPath)) {
+                throw new IllegalStateException(
+                        "Transducer 模式需要 encoder/decoder/joiner 三件套:\n"
+                                + "  " + encoderPath + "\n"
+                                + "  " + decoderPath + "\n"
+                                + "  " + joinerPath + "\n"
+                                + "请跑: ./scripts/download-kws-deps.sh");
+            }
+            modelConfig = OnlineModelConfig.builder()
+                    .setTransducer(OnlineTransducerModelConfig.builder()
+                            .setEncoder(encoderPath.toString())
+                            .setDecoder(decoderPath.toString())
+                            .setJoiner(joinerPath.toString())
+                            .build())
+                    .setTokens(tokensPath.toString())
+                    .setNumThreads(props.numThreads())
+                    .build();
+        }
 
         KeywordSpotterConfig config = KeywordSpotterConfig.builder()
                 .setOnlineModelConfig(modelConfig)
