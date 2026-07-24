@@ -2,6 +2,8 @@
 import { ref, computed, onMounted, onBeforeUnmount, nextTick } from 'vue'
 import { VoiceClient } from './api/voiceClient'
 import { AudioRecorder } from './audio/recorder'
+import { KwsClient } from './api/kwsClient'
+import { KwsMonitor } from './audio/kwsMonitor'
 
 type Status = 'idle' | 'connecting' | 'ready' | 'thinking' | 'error'
 
@@ -25,6 +27,14 @@ let client: VoiceClient | null = null
 const recorder = new AudioRecorder()
 const isRecording = ref(false)
 const isSpeaking = ref(false)
+
+// v3 KWS 唤醒词集成 (后台运行,不需用户手动启)
+const kwsClient = new KwsClient()
+const kwsMonitor = new KwsMonitor()
+const kwsListening = ref(false)
+const kwsKeywords = ref<string[]>([])
+let kwsAutoStopTimer: number | null = null  // KWS 唤醒后自动停录音的 10s 超时
+let kwsAutoRecording = false  // 标记录音是否由 KWS 触发（用于控制是否要回 KWS 监听）
 
 // ⚠️ Fix 1: mic录音和TTS播音乐合用同一个AudioContext会被状态污染（AudioContext.close后buffer还在引用里）。
 //           现在用完全独立的两套：mic录音 = recorder.ts 自己 new 的 (sampleRate 16000),
@@ -61,6 +71,12 @@ async function playAssistantAudio(base64Audio: string) {
     source.onended = () => {
       isSpeaking.value = false
       if (currentSource === source) currentSource = null
+      // v3: TTS 播完,如果上次录音是 KWS 触发的,重启 KWS 监听
+      if (kwsAutoRecording) {
+        kwsAutoRecording = false
+        console.log('[kws] TTS 播完,重启 KWS 监听')
+        startKwsListening()
+      }
     }
     console.log('[audio] 播放 CTO 回复:', buffer.duration.toFixed(2), '秒')
   } catch (e: any) {
@@ -276,12 +292,103 @@ function connect() {
   client.connect()
 }
 
+// ====== v3 KWS 唤醒词逻辑 ======
+
+function clearKwsAutoStop() {
+  if (kwsAutoStopTimer !== null) {
+    clearTimeout(kwsAutoStopTimer)
+    kwsAutoStopTimer = null
+  }
+}
+
+async function startKwsListening() {
+  // 互斥: KWS 监听不能跟手动录音同时
+  if (isRecording.value) return
+  if (kwsListening.value) return
+  try {
+    await kwsMonitor.start(kwsClient)
+    kwsListening.value = true
+    console.log('[kws] 🎧 监听启动')
+  } catch (e: any) {
+    kwsListening.value = false
+    console.error('[kws] 启动失败:', e?.message || e)
+    alert('KWS 启动失败:' + (e?.message || e) + '\n请检查麦克风权限')
+  }
+}
+
+function stopKwsListening() {
+  if (!kwsListening.value) return
+  kwsMonitor.stop()
+  kwsListening.value = false
+  console.log('[kws] 🎧 监听停止')
+}
+
+function setupKwsHandlers() {
+  kwsClient.on('open', () => console.log('[kws] WS connected'))
+
+  kwsClient.on('close', () => {
+    console.log('[kws] WS closed')
+    kwsListening.value = false
+  })
+
+  kwsClient.on('error', (ev: Event) => console.warn('[kws] WS error', ev))
+
+  kwsClient.on('kws.ack', (msg: any) => {
+    kwsKeywords.value = msg.keywords || []
+    console.log('[kws] 关键词:', kwsKeywords.value)
+  })
+
+  kwsClient.on('wake.detected', async (msg: any) => {
+    console.log('[kws] 🔥 唤醒词检测到:', msg.keyword)
+    // 后端 KwsService 已自动停止监听 + 发送 wake.detected
+    kwsListening.value = false
+    // 互斥: 不在用户手动录音中时才接管
+    if (isRecording.value) {
+      console.log('[kws] 用户正在手动录音,忽略本次唤醒')
+      return
+    }
+    kwsAutoRecording = true
+    try {
+      if (recorder && client) {
+        // 停 TTS (防 KWS 录音录到扬声器)
+        if (currentSource) {
+          try { currentSource.stop() } catch {}
+        }
+        await recorder.start(client)
+        isRecording.value = true
+        // 10s 自动停超时
+        clearKwsAutoStop()
+        kwsAutoStopTimer = window.setTimeout(() => {
+          if (kwsAutoRecording && isRecording.value) {
+            console.log('[kws] 10s 超时,自动停录音')
+            micUp()  // 复用 micUp 流程 (录音停止 + 冷却)
+            // micUp 会清 isRecording 和设 micCooldown,但不会重启 KWS
+            // KWS 重启由 turn.done 后的 playAssistantAudio.onended 触发
+          }
+        }, 10000)
+      }
+    } catch (e: any) {
+      console.error('[kws] 自动录音失败:', e?.message || e)
+      kwsAutoRecording = false
+    }
+  })
+}
+
 onMounted(() => {
   connect()
+  // v3: 页面打开即启 KWS 唤醒监听 (后台,不干扰现有 chat 流程)
+  setupKwsHandlers()
+  kwsClient.connect()
+  kwsClient.on('open', () => {
+    startKwsListening()
+  })
 })
 
 onBeforeUnmount(() => {
   if (isRecording.value) recorder.cancel()
+  clearKwsAutoStop()
+  stopKwsListening()
+  kwsClient.close()
   client?.close()
 })
 </script>
@@ -291,7 +398,7 @@ onBeforeUnmount(() => {
     <header>
       <h1>OpenClaw Voice Node · 文字聊天</h1>
       <div class="header-right">
-        <a class="link kws-link" href="#/kws" title="跳转到 KWS 唤醒页面">🎙️ KWS 唤醒</a>
+        <span v-if="kwsListening" class="status kws-listening" title="KWS 唤醒词监听中">🎧 唤醒监听中</span>
         <span class="status" :class="status">{{ statusText }}</span>
         <span v-if="isSpeaking" class="status speaking">🔊 说话中…</span>
         <button v-if="status === 'idle' || status === 'error'" class="link" @click="connect">
@@ -398,6 +505,15 @@ header h1 { margin: 0; font-size: 18px; font-weight: 600; }
 .status.ready { background: var(--green); color: #0a2a14; }
 .status.thinking { background: var(--accent); color: white; }
 .status.error { background: var(--red); color: white; }
+.status.kws-listening {
+  background: rgba(52, 199, 89, 0.15);
+  color: var(--green, #34c759);
+  animation: kws-pulse 2s ease-in-out infinite;
+}
+@keyframes kws-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.6; }
+}
 .status.connecting { background: var(--accent); color: white; opacity: 0.6; }
 .status.idle { background: var(--panel); color: var(--ink-dim); }
 
