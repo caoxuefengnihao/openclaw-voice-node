@@ -35,11 +35,11 @@ export class KwsMonitor {
 
     console.log('[kws-monitor] 请求麦克风权限...')
 
-    // 跟 recorder.ts 一样的 mic 配置 (BT 耳机坑修复)
+    // 跟 recorder.ts 一样的 mic 配置
     this.mediaStream = await navigator.mediaDevices.getUserMedia({
       audio: {
         channelCount: 1,
-        echoCancellation: false,  // BT 耳机必关!
+        echoCancellation: false,  // BT 耳机坑 (跟 recorder.ts 一致)
         noiseSuppression: true,
       },
     })
