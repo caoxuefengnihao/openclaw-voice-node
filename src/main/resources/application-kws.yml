@@ -1,0 +1,34 @@
+# voice-node KWS (Keyword Spotting) 独立配置 (v3 新增)
+# 完全独立于 application.yml,通过 Spring profile 加载。
+#
+# 启动方式:
+#   mvn spring-boot:run -Dspring.profiles.active=kws
+#
+# 或者 IDE 里设环境变量:
+#   SPRING_PROFILES_ACTIVE=kws
+
+kws:
+  # KWS 模型目录 (encoder.onnx + tokens.txt + keywords.txt)
+  # 默认: ${project.basedir}/models/kws
+  # 跑 ./scripts/download-kws-deps.sh 下模型
+  model-dir: ${project.basedir}/models/kws
+
+  # sherpa-onnx KeywordSpotter 推理 CPU 线程数
+  # KWS 模型轻量,1 线程够用;跟 STT 共用 CPU 资源
+  num-threads: 1
+
+  # 输入 PCM 采样率 (KWS 模型训练在 16kHz,固定)
+  sample-rate: 16000
+
+  # 唤醒阈值 0.1~0.9
+  # 越低越灵敏(易误触发),越高越不灵敏(易漏触发)
+  # 安静环境: 0.6 (默认)
+  # 嘈杂环境: 0.7+ (调高防误触发)
+  threshold: 0.6
+
+  # 总开关。false 时 KwsService.init() 直接返回,不加载模型。
+  # 紧急情况下快速关闭 KWS 监听。
+  enabled: true
+
+# 注意:openclaw.gateway/stt/tts 等现有配置不在这里,继续从 application.yml 读。
+# 这意味着启用 kws profile 后,Gateway 鉴权、STT 模型、TTS 等仍然走现有配置。
