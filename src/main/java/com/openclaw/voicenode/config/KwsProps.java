@@ -19,7 +19,7 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
  *
  * @see com.openclaw.voicenode.service.KwsService
  */
-@ConfigurationProperties(prefix = "kws")
+@ConfigurationProperties(prefix = "openclaw.kws")
 public record KwsProps(
         String modelDir,
         int numThreads,

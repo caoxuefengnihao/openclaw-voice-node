@@ -49,6 +49,17 @@ openclaw:
     num-threads: 2
     sample-rate: 16000
 
+  # sherpa-onnx KWS 唤醒词配置（v3 新增）
+  # 复用同一个 sherpa-onnx JVM jar + native lib（已在 STT 装过）
+  # 模型：sherpa-onnx-kws-zipformer-wenetspeech-3.3M (transducer 架构: encoder + decoder + joiner)
+  # 下模型：./scripts/download-kws-deps.sh
+  kws:
+    model-dir: ${user.dir}/models/kws
+    num-threads: 1
+    sample-rate: 16000
+    threshold: 0.6       # 唤醒阈值 0.1~0.9,越高越不灵敏
+    enabled: true        # 紧急关闭 KWS (设 false 后 KwsService.init() 跳过加载)
+
 talk:
   # 默认 mode = stt-tts + managed-room（不依赖 OpenAI Realtime 账号）
   mode: stt-tts
