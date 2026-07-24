@@ -291,6 +291,7 @@ onBeforeUnmount(() => {
     <header>
       <h1>OpenClaw Voice Node · 文字聊天</h1>
       <div class="header-right">
+        <a class="link kws-link" href="#/kws" title="跳转到 KWS 唤醒页面">🎙️ KWS 唤醒</a>
         <span class="status" :class="status">{{ statusText }}</span>
         <span v-if="isSpeaking" class="status speaking">🔊 说话中…</span>
         <button v-if="status === 'idle' || status === 'error'" class="link" @click="connect">
