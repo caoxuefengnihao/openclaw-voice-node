@@ -31,7 +31,17 @@ public record KwsProps(
          * true: 期望 encoder.onnx + tokens.txt + keywords.txt (CTC 模式)
          * false (默认): 期望 encoder/decoder/joiner + tokens.txt + keywords.txt (transducer 模式)
          */
-        boolean useCtc
+        boolean useCtc,
+        /**
+         * 唤醒命中后冷却时间(毫秒)。同一 session 在此时间内再次唤醒会被丢弃,
+         * 避免一句话被识别成多次唤醒。借鉴白龙马项目 kws-process.cjs 默认 800ms。
+         */
+        long cooldownMs,
+        /**
+         * 唤醒分数偏置(参考 sherpa-onnx keywords_score)。默认 1.5,
+         * 白龙马调高到 3.0 实测召回率从 9/17 提升到 13/17。
+         */
+        float keywordsScore
 ) {
     public KwsProps {
         if (modelDir == null || modelDir.isBlank()) {
@@ -48,6 +58,12 @@ public record KwsProps(
         }
         if (threshold < 0.1f || threshold > 0.9f) {
             threshold = 0.6f;
+        }
+        if (cooldownMs < 0) {
+            cooldownMs = 800L;  // 白龙马默认
+        }
+        if (keywordsScore <= 0) {
+            keywordsScore = 1.5f;
         }
     }
 }

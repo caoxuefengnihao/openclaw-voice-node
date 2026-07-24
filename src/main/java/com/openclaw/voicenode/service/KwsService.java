@@ -59,6 +59,8 @@ public class KwsService {
      * <p>ConcurrentHashMap 因为每个 session 独立 start/stop,acceptFrame 走 synchronized。
      */
     private final Map<String, OnlineStream> sessionStreams = new ConcurrentHashMap<>();
+    /** sessionId -> 上次唤醒命中时间戳(毫秒)。cooldown 防同一句话被识别成多次唤醒 */
+    private final Map<String, Long> sessionLastHitAt = new ConcurrentHashMap<>();
 
     public KwsService(KwsProps props) {
         this.props = props;
@@ -139,6 +141,7 @@ public class KwsService {
                 .setFeatureConfig(featureConfig)
                 .setKeywordsFile(keywordsPath.toString())
                 .setKeywordsThreshold(props.threshold())
+                .setKeywordsScore(props.keywordsScore())
                 .build();
 
         this.spotter = new KeywordSpotter(config);
@@ -184,6 +187,16 @@ public class KwsService {
             return "";
         }
 
+        // cooldown:同 session 在冷却期内不重复返回唤醒词,防同一句话多次触发
+        // 借鉴白龙马 kws-process.cjs (COOLDOWN_MS=800)
+        long cooldownMs = props.cooldownMs();
+        if (cooldownMs > 0) {
+            Long last = sessionLastHitAt.get(sessionId);
+            if (last != null && (System.currentTimeMillis() - last) < cooldownMs) {
+                return "";  // 冷却中,丢弃本次命中
+            }
+        }
+
         float[] samples = pcm16kMonoInt16ToFloat(pcmFrame);
         stream.acceptWaveform(samples, props.sampleRate());
 
@@ -193,9 +206,10 @@ public class KwsService {
 
         KeywordSpotterResult result = spotter.getResult(stream);
         if (!result.getKeyword().isEmpty()) {
-            // 命中 -> 重置 stream,准备下一轮监听
+            // 命中 -> 重置 stream + 记录冷却时间,准备下一轮监听
             stream.release();
             sessionStreams.put(sessionId, spotter.createStream());
+            sessionLastHitAt.put(sessionId, System.currentTimeMillis());
             log.info("🔥 Wake detected: session={}, keyword={}", sessionId, result.getKeyword());
             return result.getKeyword();
         }
@@ -248,6 +262,7 @@ public class KwsService {
     public void destroy() {
         sessionStreams.values().forEach(OnlineStream::release);
         sessionStreams.clear();
+        sessionLastHitAt.clear();
         if (spotter != null) {
             spotter.release();
             spotter = null;
