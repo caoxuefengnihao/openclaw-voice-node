@@ -62,11 +62,18 @@ export class KwsMonitor {
     // AudioWorklet 每 ~100ms 推 PCM,直接发 KWS 客户端 (后端逐帧过 KwsService)
     this.workletNode.port.onmessage = (e: MessageEvent<ArrayBuffer>) => {
       if (this.client) {
-        this.client.sendAudio(new Int16Array(e.data))
-        this.chunkCount++
-        if (this.chunkCount % 50 === 0) {
-          console.log(`[kws-monitor] 已发 ${this.chunkCount} 块 PCM`)
+        const pcm = new Int16Array(e.data)
+        // 调试: 每 10 块打 maxAmp,看 mic 是否实际拾到音频
+        if (this.chunkCount % 10 === 0) {
+          let maxAmp = 0
+          for (let i = 0; i < pcm.length; i++) {
+            const abs = pcm[i] < 0 ? -pcm[i] : pcm[i]
+            if (abs > maxAmp) maxAmp = abs
+          }
+          console.log(`[kws-monitor] chunk=${this.chunkCount} maxAmp=${maxAmp}/32767`)
         }
+        this.client.sendAudio(pcm)
+        this.chunkCount++
       }
     }
 

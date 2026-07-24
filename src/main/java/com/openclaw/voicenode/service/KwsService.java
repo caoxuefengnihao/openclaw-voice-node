@@ -63,6 +63,15 @@ public class KwsService {
     private final Map<String, Long> sessionLastHitAt = new ConcurrentHashMap<>();
     /** sessionId -> 接受过的帧数 (调试: 确认 KWS 在持续处理) */
     private final Map<String, Long> sessionFrameCount = new ConcurrentHashMap<>();
+    /** sessionId -> 累积中的 float 样本 buffer,凑够 ~500ms 才喂 acceptWaveform */
+    private final Map<String, float[]> sessionSampleBuffer = new ConcurrentHashMap<>();
+    /** sessionId -> 当前 buffer 已填的样本数 */
+    private final Map<String, Integer> sessionBufferFill = new ConcurrentHashMap<>();
+    /** 累积阈值: 500ms @16kHz = 8000 样本。
+     *  fbank frame_length=25ms / shift=10ms → 8000 样本 = 50 fbank 帧
+     *  (Zipformer chunk_size=16, left_context=64 → 至少 80 帧才 ready)。
+     *  上次 1600 样本只够 10 fbank 帧, 离 chunk_size 差 6 倍。 */
+    private static final int SAMPLES_PER_FEED = 8000;
 
     public KwsService(KwsProps props) {
         this.props = props;
@@ -199,18 +208,61 @@ public class KwsService {
             }
         }
 
-        float[] samples = pcm16kMonoInt16ToFloat(pcmFrame);
-        stream.acceptWaveform(samples, props.sampleRate());
+        float[] chunkSamples = pcm16kMonoInt16ToFloat(pcmFrame);
 
-        while (spotter.isReady(stream)) {
-            spotter.decode(stream);
+        // 累积样本到 ~100ms 才喂 acceptWaveform (前端 256 字节/帧 < 1 个 fbank 帧,必须累积)
+        float[] buffer = sessionSampleBuffer.computeIfAbsent(sessionId, k -> new float[SAMPLES_PER_FEED * 2]);
+        int fill = sessionBufferFill.getOrDefault(sessionId, 0);
+
+        int copyLen = Math.min(chunkSamples.length, buffer.length - fill);
+        System.arraycopy(chunkSamples, 0, buffer, fill, copyLen);
+        fill += copyLen;
+
+        // 攒满或接近攒满时喂一次
+        if (fill >= SAMPLES_PER_FEED) {
+            float[] toFeed = new float[fill];
+            System.arraycopy(buffer, 0, toFeed, 0, fill);
+
+            // 调试: 算 maxAmp 看音频是否真的到了后端 (前端 maxAmp=18000 时这里应该 ~0.55)
+            float maxAbs = 0f;
+            for (int i = 0; i < toFeed.length; i++) {
+                float a = toFeed[i] < 0 ? -toFeed[i] : toFeed[i];
+                if (a > maxAbs) maxAbs = a;
+            }
+
+            stream.acceptWaveform(toFeed, 16000);  // 硬编 16kHz — 之前 props.sampleRate() 可能拿到 0/错误值
+            // 上次 sendAudio() 调用接受的是录音模型采样率,不对。KWS 必须 16kHz。
+
+            while (spotter.isReady(stream)) {
+                spotter.decode(stream);
+            }
+
+            // 调试: 每 5 次喂入打一次 (5 * ~100ms = 500ms),看音频幅度 + 关键状态
+            long feedCount = sessionLastHitAt.containsKey(sessionId + "_feed") ? 1 : 1; // placeholder
+            long feedN = (Long) sessionLastHitAt.computeIfAbsent(sessionId + "_feedCount", k -> 0L) + 1;
+            sessionLastHitAt.put(sessionId + "_feedCount", feedN);
+            if (feedN % 5 == 0) {
+                log.info("🎵 KWS feed#{} session={} samples={} maxAmp={} stream_ready={}",
+                        feedN, sessionId, toFeed.length,
+                        String.format("%.4f", maxAbs), spotter.isReady(stream));
+            }
+            // 剩余样本移位
+            int remaining = 0;
+            if (copyLen < chunkSamples.length) {
+                int leftover = chunkSamples.length - copyLen;
+                System.arraycopy(chunkSamples, copyLen, buffer, 0, leftover);
+                remaining = leftover;
+            }
+            sessionBufferFill.put(sessionId, remaining);
+        } else {
+            sessionBufferFill.put(sessionId, fill);
         }
 
-        // 调试: 每 200 帧打一次 KWS 内部状态,看是否真的在持续处理
+        // 调试: 每 200 帧打一次 KWS 内部状态
         long frames = sessionFrameCount.merge(sessionId, 1L, Long::sum);
         if (frames % 200 == 0) {
-            log.debug("🔍 KWS session={} frames={} stream_ready={}",
-                    sessionId, frames, spotter.isReady(stream));
+            log.debug("🔍 KWS session={} frames={} buffer_fill={} stream_ready={}",
+                    sessionId, frames, sessionBufferFill.getOrDefault(sessionId, 0), spotter.isReady(stream));
         }
 
         KeywordSpotterResult result = spotter.getResult(stream);
@@ -230,12 +282,18 @@ public class KwsService {
      *
      * @param sessionId WS session id
      */
+    /**
+     * 重置 session,清理累积 buffer 和命中时间。WebSocket 关闭时由 KwsWebSocketHandler 调。
+     */
     public synchronized void stopSession(String sessionId) {
-        OnlineStream stream = sessionStreams.remove(sessionId);
-        if (stream != null) {
-            stream.release();
-            log.info("🔥 KWS session stopped: {}", sessionId);
-        }
+        if (!sessionStreams.containsKey(sessionId)) return;
+        OnlineStream old = sessionStreams.remove(sessionId);
+        if (old != null) old.release();
+        sessionLastHitAt.remove(sessionId);
+        sessionFrameCount.remove(sessionId);
+        sessionSampleBuffer.remove(sessionId);
+        sessionBufferFill.remove(sessionId);
+        log.info("🔥 KWS session stopped: {}", sessionId);
     }
 
     /**
@@ -290,6 +348,8 @@ public class KwsService {
             short s = (short) ((pcm[2 * i] & 0xff) | ((pcm[2 * i + 1] & 0xff) << 8));
             out[i] = s / 32768f;
         }
+        // 调试: 第一次调 + 每 500 次打一次"后端实际解析的样本"前 4 个
+        // 跟 KwsWebSocketHandler 的 raw bytes 对比
         return out;
     }
 }

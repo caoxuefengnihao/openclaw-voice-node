@@ -90,10 +90,29 @@ public class KwsWebSocketHandler extends AbstractWebSocketHandler {
     @Override
     protected void handleBinaryMessage(WebSocketSession session, BinaryMessage message) {
         String mode = (String) session.getAttributes().get(ATTR_MODE);
-        byte[] payload = message.getPayload().array();
+        // 修: ByteBuffer.array() 返回 backing array,可能大于实际数据 (限是 limit())
+        // 改用 remaining() 拿到真实长度,避免读到垃圾 0
+        java.nio.ByteBuffer kwsBuf = message.getPayload();
+        byte[] payload = new byte[kwsBuf.remaining()];
+        kwsBuf.get(payload);
 
         if ("kws".equals(mode)) {
             // KWS 模式:每帧过 KwsService
+            // 诊断: 每 200 帧打一次原始字节,看后端实际收到的内容
+            Integer dbgCount = (Integer) session.getAttributes().computeIfAbsent("_dbgKwsRaw", k -> 0);
+            dbgCount++;
+            session.getAttributes().put("_dbgKwsRaw", dbgCount);
+            if (dbgCount % 200 == 0 && payload.length >= 8) {
+                int[] head = new int[4];
+                for (int j = 0; j < 4; j++) {
+                    int lo = payload[2 * j] & 0xff;
+                    int hi = payload[2 * j + 1] & 0xff;
+                    short s = (short) ((hi << 8) | lo);
+                    head[j] = s;
+                }
+                log.info("🔬 KWS raw payload.len={} head4samples={}",
+                        payload.length, java.util.Arrays.toString(head));
+            }
             String keyword = kwsService.acceptFrame(session.getId(), payload);
             if (!keyword.isEmpty()) {
                 log.info("🔥 Wake detected: session={}, keyword={}", session.getId(), keyword);
