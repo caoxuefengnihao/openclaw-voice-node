@@ -24,4 +24,7 @@ export default defineConfig({
       },
     },
   },
+  // SPA fallback: 访问 /kws 等未匹配路径 fallback 到 index.html,
+  // main.ts 根据 location.pathname 决定渲染 KwsPage 或 App。
+  // 跟原配置一致,不加多页入口。
 })
