@@ -160,8 +160,11 @@ async function micDown() {
   }
 
   try {
-    isRecording.value = true
+    // 先 await start 成功,再标 isRecording=true
+    // 避免 start 还没完成(等 getUserMedia 中)就被 pointerleave 触发的 micUp stop 掉,
+    // 导致 audioContext 为 null 的报警循环
     await recorder.start(client)
+    isRecording.value = true
   } catch (e: any) {
     isRecording.value = false
     console.error('[mic] start failed:', e)
@@ -451,8 +454,7 @@ onBeforeUnmount(() => {
         :disabled="status !== 'ready'"
         @pointerdown.prevent="micDown"
         @pointerup.prevent="micUp"
-        @pointerleave.prevent="micUp"
-        @pointercancel.prevent="micUp"
+        @click.prevent
         :title="isRecording ? '松开发送' : '按住说话'"
       >
         {{ isRecording ? '🎙️ 松开发送' : '🎙️' }}
