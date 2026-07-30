@@ -66,6 +66,21 @@ openclaw:
     cooldown-ms: 800     # 命中后冷却,防同一句话被识别成多次唤醒 (借鉴白龙马)
     keywords-score: 3.0  # 唤醒分数偏置 (借鉴白龙马,实测 3.0 召回最佳)
 
+  # sherpa-onnx VAD 配置 (v3-vad 新增, 2026-07-30)
+  # 复用同一个 sherpa-onnx JVM jar + native lib(已在 STT/KWS 装过)
+  # 模型:silero-vad v4 (~1.8MB ONNX, window_size=512, 16kHz 单声道)
+  # 下模型:./scripts/download-vad-deps.sh
+  # 设计文档:docs/voice-node-v3-vad.md
+  vad:
+    model-dir: ${user.dir}/models/vad
+    num-threads: 1
+    sample-rate: 16000
+    threshold: 0.5               # 语音概率阈值, silero 出厂值 (实测待 BT 麦底噪调优)
+    min-speech-duration-ms: 250  # 最小说话时长(防短促"嗯"误触发)
+    min-silence-duration-ms: 100 # 最小静音时长(切分边界)
+    window-size: 512             # silero-vad v4 固定 512, 勿改
+    enabled: true                # false 时降级到整段 STT, 不阻塞主链路
+
 talk:
   # 默认 mode = stt-tts + managed-room（不依赖 OpenAI Realtime 账号）
   mode: stt-tts
