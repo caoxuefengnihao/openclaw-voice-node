@@ -143,6 +143,11 @@ public class KwsService {
                             .build())
                     .setTokens(tokensPath.toString())
                     .setNumThreads(props.numThreads())
+                    // 模型名 epoch-99-avg-1-chunk-16-left-64 是 Zipformer2
+                    // (chunk_size=16 + left_context=64 是 Zipformer2 特征参数)
+                    // 不设 modelType 默认空字符串,sherpa-onnx 会按经典 transducer 处理
+                    // → fbank 路径不对 → isReady 永远 false (v1.13.4 已知坑)
+                    .setModelType("zipformer2")
                     .build();
         }
 
@@ -152,6 +157,10 @@ public class KwsService {
                 .setKeywordsFile(keywordsPath.toString())
                 .setKeywordsThreshold(props.threshold())
                 .setKeywordsScore(props.keywordsScore())
+                // 不设 maxActivePaths + numTrailingBlanks → KWS 不正常工作
+                // 参考 sherpa-onnx keyword-spotting 示例
+                .setMaxActivePaths(4)
+                .setNumTrailingBlanks(1)
                 .build();
 
         this.spotter = new KeywordSpotter(config);
