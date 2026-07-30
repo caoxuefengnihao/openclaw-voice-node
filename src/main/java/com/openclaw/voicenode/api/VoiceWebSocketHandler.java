@@ -1,9 +1,11 @@
 package com.openclaw.voicenode.api;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.openclaw.voicenode.service.AudioUtil;
 import com.openclaw.voicenode.service.ChatBridgeService;
 import com.openclaw.voicenode.service.ChatSessionHandle;
 import com.openclaw.voicenode.service.SttService;
+import com.openclaw.voicenode.service.VadService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
@@ -17,6 +19,7 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.util.Base64;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 
 /**
@@ -43,6 +46,7 @@ public class VoiceWebSocketHandler extends AbstractWebSocketHandler {
 
     private final ChatBridgeService chatBridge;
     private final SttService sttService;
+    private final VadService vadService;  // v3-vad 新增
     private final com.openclaw.voicenode.service.TtsService ttsService;
     private final ObjectMapper mapper = new ObjectMapper();
 
@@ -164,23 +168,55 @@ public class VoiceWebSocketHandler extends AbstractWebSocketHandler {
                         ? String.format("chunks=%d, bytes=%d, maxAmp=%d/32767",
                                 stats.chunkCount, stats.totalBytes, stats.maxAmp)
                         : "(no stats — 可能浏览器没发 audio.chunk)");
-            try {
-                String text = sttService.recognize(pcm);
-                sendToBrowser(session, Map.of(
-                        "type", "user.text",
-                        "text", text,
-                        "isFinal", true
-                ));
 
-                // M2: STT 识别的文字当作 chat 输入,触发 cto 回复
-                // turn.done 时上面的监听器会自动拿全文字调 TTS 推 assistant.audio
-                if (chat != null && !text.isBlank()) {
-                    log.info("📤 STT → chat.sendText: \"{}\"", text);
-                    chat.sendText(text);
+            // === v3-vad: VAD 切分 → 每段 STT → 拼接 ===
+            List<VadService.VadSegment> segments;
+            float[] pcmFloat32 = AudioUtil.pcmInt16LeToFloat32(pcm);
+            try {
+                segments = vadService.split(pcmFloat32);
+            } catch (Exception e) {
+                // VAD 失败时降级:整段当作单段 (跟旧行为一致)
+                log.warn("⚠️ VAD 切分失败,降级到整段 STT: {}", e.getMessage());
+                segments = List.of(new VadService.VadSegment(0, pcmFloat32.length));
+            }
+            log.info("🎙️ VAD 切分: {} 段 ({}ms 总)",
+                    segments.size(), pcmFloat32.length * 1000 / 16000);
+
+            StringBuilder sb = new StringBuilder();
+            int succeededSegs = 0;
+            for (int i = 0; i < segments.size(); i++) {
+                VadService.VadSegment seg = segments.get(i);
+                byte[] segInt16 = AudioUtil.float32SliceToPcmInt16Le(
+                        pcmFloat32, seg.startSample(), seg.sampleCount());
+                try {
+                    String segText = sttService.recognize(segInt16);
+                    if (!segText.isBlank()) {
+                        if (sb.length() > 0) sb.append(' ');  // 段间空格
+                        sb.append(segText);
+                        succeededSegs++;
+                    }
+                } catch (SttService.SttException e) {
+                    log.warn("⚠️ 段 {} STT 失败 ({}ms): {}", i, (int) seg.durationMs(), e.getMessage());
+                    // 单段失败不影响其他段,继续
                 }
-            } catch (SttService.SttException e) {
-                log.warn("STT 失败: {}", e.getMessage());
-                sendToBrowser(session, Map.of("type", "error", "message", "STT failed: " + e.getMessage()));
+            }
+
+            String finalText = sb.toString().trim();
+            sendToBrowser(session, Map.of(
+                    "type", "user.text",
+                    "text", finalText,
+                    "isFinal", true,
+                    "vadSegments", segments.size()  // 调试用字段,前端可显示"已切分 N 段"
+            ));
+
+            // M2: STT 识别的文字当作 chat 输入,触发 cto 回复
+            // turn.done 时上面的监听器会自动拿全文字调 TTS 推 assistant.audio
+            if (chat != null && !finalText.isBlank()) {
+                log.info("📤 VAD[{}段/成功{}段] STT → chat.sendText: \"{}\"",
+                        segments.size(), succeededSegs, finalText);
+                chat.sendText(finalText);
+            } else if (segments.size() > 0 && finalText.isBlank()) {
+                log.info("⚠️ VAD 切出 {} 段但 STT 都识别为空 (可能是静音/噪声)", segments.size());
             }
         } else if ("audio.cancel".equals(type)) {
             session.getAttributes().remove(ATTR_PCM_BUFFER);

@@ -94,7 +94,7 @@ public class SttService {
             throw new SttException("音频太短: " + (pcm16kMonoInt16LE == null ? 0 : pcm16kMonoInt16LE.length) + " bytes");
         }
 
-        float[] samples = pcm16MonoInt16ToFloat(pcm16kMonoInt16LE);
+        float[] samples = AudioUtil.pcmInt16LeToFloat32(pcm16kMonoInt16LE);
 
         long t0 = System.currentTimeMillis();
         OfflineStream stream = recognizer.createStream();
@@ -114,19 +114,6 @@ public class SttService {
         } finally {
             stream.release();
         }
-    }
-
-    /**
-     * PCM 16kHz mono int16 little-endian → float32 [-1.0, 1.0]
-     */
-    private static float[] pcm16MonoInt16ToFloat(byte[] pcm) {
-        int n = pcm.length / 2;
-        float[] out = new float[n];
-        for (int i = 0; i < n; i++) {
-            short s = (short) ((pcm[2 * i] & 0xff) | ((pcm[2 * i + 1] & 0xff) << 8));
-            out[i] = s / 32768f;
-        }
-        return out;
     }
 
     /** STT 失败的统一异常,handler 捕获后决定降级还是推错误给浏览器。 */
