@@ -6,6 +6,7 @@ import com.openclaw.voicenode.service.ChatSessionHandle;
 import com.openclaw.voicenode.service.KwsService;
 import com.openclaw.voicenode.service.SttService;
 import com.openclaw.voicenode.service.TtsService;
+import com.openclaw.voicenode.service.VadService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
@@ -17,6 +18,8 @@ import org.springframework.web.socket.handler.AbstractWebSocketHandler;
 
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.util.Base64;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -56,11 +59,25 @@ public class KwsWebSocketHandler extends AbstractWebSocketHandler {
     private final SttService sttService;          // 复用现有
     private final TtsService ttsService;          // 复用现有
     private final ChatBridgeService chatBridge;   // 复用现有
+    private final VadService vadService;          // v3-vad B 方案: 后端 VAD 自动切分录音
     private final ObjectMapper mapper = new ObjectMapper();
 
     private static final String ATTR_CHAT = "chat";
     private static final String ATTR_PCM_BUFFER = "pcmBuffer";
     private static final String ATTR_MODE = "mode";   // "kws" | "recording"
+    private static final String ATTR_VAD_FRAME_COUNT = "_vadFrameCount";
+
+    /**
+     * 每多少个 binary 帧 (100ms/帧) 做一次 VAD 检测。
+     * 500ms 一次足够灵敏,也不会过度消耗 CPU (silero-vad v4 一帧 ~1ms)。
+     */
+    private static final int VAD_CHECK_INTERVAL = 5;
+
+    /**
+     * 检测到说话结束后,需要持续多久的静音才确认"说完了"。
+     * 默认 800ms (silero-vad minSilenceDuration 是 500ms,加 300ms buffer 防误判)。
+     */
+    private static final float VAD_SILENCE_CONFIRM_MS = 800f;
 
     @Override
     public void afterConnectionEstablished(WebSocketSession session) throws Exception {
@@ -126,7 +143,7 @@ public class KwsWebSocketHandler extends AbstractWebSocketHandler {
                 ));
             }
         } else {
-            // 录音模式或其他:累积到 buffer
+            // 录音模式或其他:累积到 buffer + B 方案 VAD 后端切分
             ByteArrayOutputStream buf = (ByteArrayOutputStream) session.getAttributes().get(ATTR_PCM_BUFFER);
             if (buf == null) {
                 log.warn("⚠️ KWS Handler 收到 binary 但无 audio.start,丢弃 {} bytes", payload.length);
@@ -136,6 +153,17 @@ public class KwsWebSocketHandler extends AbstractWebSocketHandler {
                 buf.write(payload);
             } catch (IOException e) {
                 log.warn("写 PCM buffer 失败", e);
+                return;
+            }
+
+            // B 方案: 后端 VAD 每 N 帧检测一次，识别到说话结束 + 静音就自动 audio.end
+            if (vadService.isEnabled()) {
+                Integer frameCount = (Integer) session.getAttributes().computeIfAbsent(ATTR_VAD_FRAME_COUNT, k -> 0);
+                frameCount++;
+                session.getAttributes().put(ATTR_VAD_FRAME_COUNT, frameCount);
+                if (frameCount % VAD_CHECK_INTERVAL == 0) {
+                    checkVadAndAutoTrigger(session, buf);
+                }
             }
         }
     }
@@ -179,34 +207,8 @@ public class KwsWebSocketHandler extends AbstractWebSocketHandler {
             sendToBrowser(session, Map.of("type", "audio.ack", "state", "recording"));
 
         } else if ("audio.end".equals(type)) {
-            // 累积结束 -> STT -> chat -> (TTS 在 turn.done 回调里)
-            ByteArrayOutputStream buf = (ByteArrayOutputStream) session.getAttributes().get(ATTR_PCM_BUFFER);
-            if (buf == null || buf.size() == 0) {
-                sendToBrowser(session, Map.of("type", "error", "message", "audio buffer empty"));
-                return;
-            }
-            byte[] pcm = buf.toByteArray();
-            session.getAttributes().remove(ATTR_PCM_BUFFER);
-            session.getAttributes().remove(ATTR_MODE);
-            log.info("🎤 KWS audio.end: {} bytes PCM ({}ms @16kHz)",
-                    pcm.length, pcm.length / 32);
-            try {
-                // 调现有 SttService
-                String text = sttService.recognize(pcm);
-                sendToBrowser(session, Map.of(
-                        "type", "user.text",
-                        "text", text,
-                        "isFinal", true
-                ));
-                // 调现有 ChatSessionHandle
-                if (chat != null && !text.isBlank()) {
-                    log.info("📤 KWS STT -> chat.sendText: \"{}\"", text);
-                    chat.sendText(text);
-                }
-            } catch (SttService.SttException e) {
-                log.warn("KWS STT 失败: {}", e.getMessage());
-                sendToBrowser(session, Map.of("type", "error", "message", "STT failed: " + e.getMessage()));
-            }
+            // 手动 audio.end -> 复用 VAD 自动触发的同一个 trigger
+            triggerSttAndChat(session, "manual");
 
         } else if ("audio.cancel".equals(type)) {
             session.getAttributes().remove(ATTR_PCM_BUFFER);
@@ -247,5 +249,101 @@ public class KwsWebSocketHandler extends AbstractWebSocketHandler {
         } catch (Exception e) {
             log.warn("KWS sendToBrowser 失败: {}", e.getMessage());
         }
+    }
+
+    /**
+     * STT + Chat 触发的公共逻辑。
+     * <p>被两处调用:
+     * <ul>
+     *   <li>手动 {@code audio.end} 文本命令 (source="manual")</li>
+     *   <li>VAD B 方案检测到说话结束 + 静音阈值 (source="vad")</li>
+     * </ul>
+     * <p>行为: 取累积的 PCM buffer → 调 SttService.recognize → 发 user.text → 发 chat.sendText。
+     * TTS 在 turn.done 回调里 (在 {@link #afterConnectionEstablished} 里注册)。
+     *
+     * @param source 触发来源, 仅用于日志 ("manual" | "vad")
+     */
+    private void triggerSttAndChat(WebSocketSession session, String source) {
+        ByteArrayOutputStream buf = (ByteArrayOutputStream) session.getAttributes().get(ATTR_PCM_BUFFER);
+        if (buf == null || buf.size() == 0) {
+            if ("manual".equals(source)) {
+                // 手动 audio.end 但 buffer 空 → 可能是前端超时后发的, 发错误提示
+                sendToBrowser(session, Map.of("type", "error", "message", "audio buffer empty"));
+            } else {
+                // VAD 触发但 buffer 空 → 静默静音刚起始被误判, 忽略
+                log.debug("🎙️ VAD auto-trigger skipped ({}): empty buffer", source);
+            }
+            return;
+        }
+        byte[] pcm = buf.toByteArray();
+        session.getAttributes().remove(ATTR_PCM_BUFFER);
+        session.getAttributes().remove(ATTR_MODE);
+        session.getAttributes().remove(ATTR_VAD_FRAME_COUNT);
+        log.info("🎤 KWS audio.end (source={}): {} bytes PCM ({}ms @16kHz)",
+                source, pcm.length, pcm.length / 32);
+        try {
+            String text = sttService.recognize(pcm);
+            sendToBrowser(session, Map.of(
+                    "type", "user.text",
+                    "text", text,
+                    "isFinal", true
+            ));
+            ChatSessionHandle chat = (ChatSessionHandle) session.getAttributes().get(ATTR_CHAT);
+            if (chat != null && !text.isBlank()) {
+                log.info("📤 KWS STT -> chat.sendText: \"{}\"", text);
+                chat.sendText(text);
+            } else {
+                log.warn("⚠️ KWS STT 没识别出文字 (空文本),不发 chat");
+            }
+        } catch (SttService.SttException e) {
+            log.warn("KWS STT 失败: {}", e.getMessage());
+            sendToBrowser(session, Map.of("type", "error", "message", "STT failed: " + e.getMessage()));
+        }
+    }
+
+    /**
+     * B 方案: 后端 VAD 检测。
+     * <p>每隔 {@link #VAD_CHECK_INTERVAL} 个 binary 帧调一次。
+     * 调用 {@link VadService#split(float[])} 拿 segments,
+     * 如果最后一段后面跟了 {@link #VAD_SILENCE_CONFIRM_MS} 以上的静音 → 触发 audio.end 流程。
+     */
+    private void checkVadAndAutoTrigger(WebSocketSession session, ByteArrayOutputStream buf) {
+        byte[] pcm = buf.toByteArray();
+        float[] samples = pcmFloat32BytesToFloat(pcm);
+        if (samples.length == 0) return;
+
+        List<VadService.VadSegment> segments = vadService.split(samples);
+        if (segments.isEmpty()) {
+            log.debug("🎙️ VAD: no segments yet (纯静音 / 语音未达 min_speech_duration)");
+            return;
+        }
+
+        VadService.VadSegment last = segments.get(segments.size() - 1);
+        int trailingSilenceSamples = samples.length - last.endSample();
+        float trailingSilenceMs = trailingSilenceSamples * 1000f / 16000f;
+
+        log.info("🎙️ VAD: {} segments, last.end={}/{}, trailing={}ms (need ≥{}ms)",
+                segments.size(), last.endSample(), samples.length,
+                String.format("%.0f", trailingSilenceMs),
+                (int) VAD_SILENCE_CONFIRM_MS);
+
+        if (trailingSilenceMs >= VAD_SILENCE_CONFIRM_MS) {
+            log.info("🎙️ VAD auto-trigger audio.end (trailing silence {}ms ≥ {}ms)",
+                    String.format("%.0f", trailingSilenceMs),
+                    (int) VAD_SILENCE_CONFIRM_MS);
+            triggerSttAndChat(session, "vad");
+        }
+    }
+
+    /**
+     * Float32 LE bytes (4 字节/样本) → float[] 数组。
+     * <p>跟 {@link KwsService#acceptFrame} 同样的格式 (前端 pcm-worklet-kws.js 输出 Float32Array.buffer)。
+     */
+    private static float[] pcmFloat32BytesToFloat(byte[] pcm) {
+        int n = pcm.length / 4;
+        if (n == 0) return new float[0];
+        float[] out = new float[n];
+        ByteBuffer.wrap(pcm).order(ByteOrder.LITTLE_ENDIAN).asFloatBuffer().get(out);
+        return out;
     }
 }

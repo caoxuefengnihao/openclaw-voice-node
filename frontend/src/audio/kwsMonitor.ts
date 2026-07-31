@@ -51,7 +51,10 @@ export class KwsMonitor {
         echoCancellation: false,    // BT 耳机坑 + KWS 都要关
         noiseSuppression: false,    // 借鉴白龙马 — KWS 必须关
         autoGainControl: false,     // 借鉴白龙马 — KWS 必须关
-        sampleRate: 16000,          // 强制 16kHz,避免 Browser 重采样
+        // ⚠️ 不写 sampleRate: 跟 recorder.ts 一致 — 浏览器自选设备 native rate,
+        // AudioContext({sampleRate: 16000}) 负责内部 resample 到 16kHz
+        // (硬约束 16k 在 BT HFP 8kHz 设备上会导致 Chrome 返回静音流,
+        //  跟 STT 路径行为不一致 → STT 能识别,KWS 不行)
       },
     })
 

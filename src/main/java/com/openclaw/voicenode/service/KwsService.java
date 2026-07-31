@@ -235,16 +235,22 @@ public class KwsService {
 
         stream.acceptWaveform(samples, props.sampleRate());
 
+        // ⚠️ 调试日志位置要在 while 之前!
+        // isReady 在 while 退出后必然 false (退出条件就是 !isReady),
+        // 放 while 之后打会永远 false,误导成 "KWS 没在工作"
+        boolean readyBeforeWhile = spotter.isReady(stream);
+        int decodesThisChunk = 0;
         while (spotter.isReady(stream)) {
             spotter.decode(stream);
+            decodesThisChunk++;
         }
 
         // 调试: 每 10 块打一次,看音频幅度 + KWS 内部状态
         long feedN = sessionFeedCount.merge(sessionId, 1L, Long::sum);
         if (feedN % 10 == 0) {
-            log.info("🎵 KWS feed#{} session={} samples={} maxAmp={} stream_ready={}",
+            log.info("🎵 KWS feed#{} session={} samples={} maxAmp={} ready_before={} decodes_this_chunk={}",
                     feedN, sessionId, samples.length,
-                    String.format("%.4f", maxAbs), spotter.isReady(stream));
+                    String.format("%.4f", maxAbs), readyBeforeWhile, decodesThisChunk);
         }
 
         KeywordSpotterResult result = spotter.getResult(stream);
