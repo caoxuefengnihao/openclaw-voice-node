@@ -76,8 +76,9 @@ public class KwsWebSocketHandler extends AbstractWebSocketHandler {
     /**
      * 检测到说话结束后,需要持续多久的静音才确认"说完了"。
      * 默认 800ms (silero-vad minSilenceDuration 是 500ms,加 300ms buffer 防误判)。
+     * 2026-08-01 调到 400ms (silero-vad 默认 min_silence 加薄 buffer), 加快录音结束响应
      */
-    private static final float VAD_SILENCE_CONFIRM_MS = 800f;
+    private static final float VAD_SILENCE_CONFIRM_MS = 400f;
 
     @Override
     public void afterConnectionEstablished(WebSocketSession session) throws Exception {
