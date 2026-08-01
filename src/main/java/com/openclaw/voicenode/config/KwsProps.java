@@ -22,6 +22,12 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
 @ConfigurationProperties(prefix = "openclaw.kws")
 public record KwsProps(
         String modelDir,
+        /**
+         * 模型文件名前缀 (不含 encoder-/decoder-/joiner- 前缀和 .int8.onnx 后缀)。
+         * 默认 "epoch-99-avg-1-chunk-16-left-64" (原预训练 8 关键词 transducer)。
+         * 自训练后改成 e.g. "epoch-20-avg-2-chunk-16-left-64"。
+         */
+        String modelPrefix,
         int numThreads,
         int sampleRate,
         float threshold,
@@ -48,6 +54,10 @@ public record KwsProps(
             // 用 ${user.dir} 而非 ${project.basedir},因为后者是 Maven resource-filter 占位符,
             // 运行时不会被 Spring 展开 (跟 STT 配置同理)
             modelDir = "${user.dir}/models/kws";
+        }
+        if (modelPrefix == null || modelPrefix.isBlank()) {
+            // 默认跟原硬编码一致,保持向后兼容
+            modelPrefix = "epoch-99-avg-1-chunk-16-left-64";
         }
         if (numThreads <= 0) {
             numThreads = 1;

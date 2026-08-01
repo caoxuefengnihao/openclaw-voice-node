@@ -79,13 +79,23 @@ export class KwsMonitor {
     this.workletNode.port.onmessage = (e: MessageEvent<ArrayBuffer>) => {
       if (this.client) {
         const pcm = new Float32Array(e.data)
+        // 计算 maxAmp (一次, 调试 + 门限共用)
+        let maxAmp = 0
+        for (let i = 0; i < pcm.length; i++) {
+          const abs = pcm[i] < 0 ? -pcm[i] : pcm[i]
+          if (abs > maxAmp) maxAmp = abs
+        }
+        // 2026-08-01 FIX: mic 振幅门限, 丢弃静音/超低噪 chunk, 防过拟合模型误触发
+        // 阈值 0.02 = 正常人最轻说话也得有 ~0.05, 0.02 以下基本是静音/底噪
+        if (maxAmp < 0.02) {
+          if (this.chunkCount % 50 === 0) {
+            console.log(`[kws-monitor] skip silent chunk=${this.chunkCount} maxAmp=${maxAmp.toFixed(4)}`)
+          }
+          this.chunkCount++
+          return
+        }
         // 调试: 每 10 块打 maxAmp,看 mic 是否实际拾到音频 (Float32 范围 [-1, 1])
         if (this.chunkCount % 10 === 0) {
-          let maxAmp = 0
-          for (let i = 0; i < pcm.length; i++) {
-            const abs = pcm[i] < 0 ? -pcm[i] : pcm[i]
-            if (abs > maxAmp) maxAmp = abs
-          }
           console.log(`[kws-monitor] chunk=${this.chunkCount} samples=${pcm.length} maxAmp=${maxAmp.toFixed(4)}/1.0`)
         }
         this.client.sendAudio(pcm)

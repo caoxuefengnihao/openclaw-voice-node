@@ -71,6 +71,8 @@ public class KwsService {
     private final Map<String, Long> sessionFrameCount = new ConcurrentHashMap<>();
     /** sessionId -> 累积的 feed 次数 (调试: 算 maxAmp) */
     private final Map<String, Long> sessionFeedCount = new ConcurrentHashMap<>();
+    /** sessionId -> 累积的静音丢弃次数 (调试: 看后端 mic gate 频度) */
+    private final Map<String, Long> sessionSilentCount = new ConcurrentHashMap<>();
 
     public KwsService(KwsProps props) {
         this.props = props;
@@ -124,9 +126,9 @@ public class KwsService {
                     .build();
         } else {
             // Transducer 模式: encoder + decoder + joiner (预训练 8 关键词模型)
-            Path encoderPath = Paths.get(props.modelDir(), "encoder-" + MODEL_PREFIX + ".int8.onnx");
-            Path decoderPath = Paths.get(props.modelDir(), "decoder-" + MODEL_PREFIX + ".int8.onnx");
-            Path joinerPath = Paths.get(props.modelDir(), "joiner-" + MODEL_PREFIX + ".int8.onnx");
+            Path encoderPath = Paths.get(props.modelDir(), "encoder-" + props.modelPrefix() + ".int8.onnx");
+            Path decoderPath = Paths.get(props.modelDir(), "decoder-" + props.modelPrefix() + ".int8.onnx");
+            Path joinerPath = Paths.get(props.modelDir(), "joiner-" + props.modelPrefix() + ".int8.onnx");
             if (!Files.exists(encoderPath) || !Files.exists(decoderPath) || !Files.exists(joinerPath)) {
                 throw new IllegalStateException(
                         "Transducer 模式需要 encoder/decoder/joiner 三件套:\n"
@@ -231,6 +233,17 @@ public class KwsService {
         for (float v : samples) {
             float a = v < 0 ? -v : v;
             if (a > maxAbs) maxAbs = a;
+        }
+
+        // 2026-08-01 FIX: 后端 mic 振幅门限 (第二道防线, 防过拟合模型误触发)
+        // 正常人声 maxAmp >= 0.05, 0.05 以下基本是底噪/冷启动残音/键盘声
+        // 前端 kwsMonitor.ts 已经有 maxAmp < 0.02 gate, 后端 0.05 = 纵深防御
+        if (maxAbs < 0.05f) {
+            long silentSkipN = sessionSilentCount.merge(sessionId, 1L, Long::sum);
+            if (silentSkipN % 50 == 0) {
+                log.info("🔇 KWS skip silent chunk (maxAmp={})", String.format("%.4f", maxAbs));
+            }
+            return "";  // 不喂模型, 不返回 wake
         }
 
         stream.acceptWaveform(samples, props.sampleRate());

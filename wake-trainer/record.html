@@ -85,6 +85,7 @@
     // URL 参数: ?keyword=jiavs (默认 jiavs)
     const KEYWORD = new URLSearchParams(location.search).get('keyword') || 'jiavs';
     document.getElementById('kw').textContent = KEYWORD;
+    document.title = `唤醒词录音 · ${KEYWORD}`;
 
     let mediaStream = null;
     let audioContext = null;
@@ -160,7 +161,7 @@
         log(`🎧 AudioContext sampleRate: ${audioContext.sampleRate}`);
 
         // 1 秒准备时间
-        setStatus('准备中... (说 "jiavs" 准备好)', 'paused');
+        setStatus(`准备中... (说 "${KEYWORD}" 准备好)`, 'paused');
         await sleep(1000);
 
         isRecording = true;
@@ -226,7 +227,7 @@
 
         // 间隔
         if (recordedCount < TARGET_COUNT) {
-          setStatus(`第 ${recordedCount + 1} 次: 准备 (说 "jiavs")`, 'paused');
+          setStatus(`第 ${recordedCount + 1} 次: 准备 (说 "${KEYWORD}")`, 'paused');
           await sleep(GAP_DURATION_MS);
         }
       }
@@ -318,7 +319,7 @@
       const url = URL.createObjectURL(content);
       const a = document.createElement('a');
       a.href = url;
-      a.download = `jiavs_recordings_${Date.now()}.zip`;
+      a.download = `${KEYWORD}_recordings_${Date.now()}.zip`;
       a.click();
       URL.revokeObjectURL(url);
       log('✅ zip 已下载', 'ok');

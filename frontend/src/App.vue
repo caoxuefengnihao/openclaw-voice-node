@@ -71,12 +71,10 @@ async function playAssistantAudio(base64Audio: string) {
     source.onended = () => {
       isSpeaking.value = false
       if (currentSource === source) currentSource = null
-      // v3: TTS 播完,如果上次录音是 KWS 触发的,重启 KWS 监听
-      if (kwsAutoRecording) {
-        kwsAutoRecording = false
-        console.log('[kws] TTS 播完,重启 KWS 监听')
-        startKwsListening()
-      }
+      // 2026-08-01 FIX: TTS 播完总是重启 KWS (不只 KWS 触发的录音)
+      // startKwsListening() 内部有 isRecording 检查防冲突
+      console.log('[kws] TTS 播完, 重启 KWS 监听')
+      startKwsListening()
     }
     console.log('[audio] 播放 CTO 回复:', buffer.duration.toFixed(2), '秒')
   } catch (e: any) {
@@ -308,9 +306,10 @@ async function startKwsListening() {
   // 互斥: KWS 监听不能跟手动录音同时
   if (isRecording.value) return
   if (kwsListening.value) return
+  // 2026-08-01 FIX: 立即设 true 防止 race (await 期间第二次调用会看到 true)
+  kwsListening.value = true
   try {
     await kwsMonitor.start(kwsClient)
-    kwsListening.value = true
     console.log('[kws] 🎧 监听启动')
   } catch (e: any) {
     kwsListening.value = false
@@ -344,7 +343,8 @@ function setupKwsHandlers() {
   kwsClient.on('wake.detected', async (msg: any) => {
     console.log('[kws] 🔥 唤醒词检测到:', msg.keyword)
     // 后端 KwsService 已自动停止监听 + 发送 wake.detected
-    kwsListening.value = false
+    // 2026-08-01 FIX: 先停前端 kwsMonitor 释放 mic, 避免 TTS 后 startKwsListening() 报 "already started"
+    stopKwsListening()
     // 互斥: 不在用户手动录音中时才接管
     if (isRecording.value) {
       console.log('[kws] 用户正在手动录音,忽略本次唤醒')
@@ -368,7 +368,7 @@ function setupKwsHandlers() {
             // micUp 会清 isRecording 和设 micCooldown,但不会重启 KWS
             // KWS 重启由 turn.done 后的 playAssistantAudio.onended 触发
           }
-        }, 10000)
+        }, 5000)
       }
     } catch (e: any) {
       console.error('[kws] 自动录音失败:', e?.message || e)
@@ -383,7 +383,8 @@ onMounted(() => {
   setupKwsHandlers()
   kwsClient.connect()
   kwsClient.on('open', () => {
-    startKwsListening()
+    // 2026-08-01 FIX: 3s 暖机 (原先 1s 不够, 冷启动 mic 状态还在调整中)
+    setTimeout(() => startKwsListening(), 3000)
   })
 })
 

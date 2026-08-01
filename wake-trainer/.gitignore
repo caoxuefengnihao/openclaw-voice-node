@@ -2,3 +2,9 @@ datasets/
 *.zip
 __pycache__/
 *.pyc
+# 预训练底座 (157MB, 不要进 commit)
+pretrained/
+
+# 早期误建的关键词文件 (改成中文"贾维斯"后这些不要)
+keywords/jarvis.txt
+keywords/ni_hao_jun_ge.txt
