@@ -267,6 +267,17 @@ public class KwsService {
         }
 
         KeywordSpotterResult result = spotter.getResult(stream);
+
+        // DEBUG: 2026-08-02 排查唤醒不触发问题, 每 10 块打 spotter 实际输出 (tokens + keyword)
+        if (feedN % 10 == 0) {
+            String tokensStr = "?";
+            try {
+                tokensStr = java.util.Arrays.toString(result.getTokens());
+            } catch (Throwable ignored) {}
+            log.info("🔍 spotter[feed#{}] session={} keyword='{}' tokens={}",
+                    feedN, sessionId, result.getKeyword(), tokensStr);
+        }
+
         if (!result.getKeyword().isEmpty()) {
             // 命中 -> 重置 stream + 记录冷却时间,准备下一轮监听
             stream.release();

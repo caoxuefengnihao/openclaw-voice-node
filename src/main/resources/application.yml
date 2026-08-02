@@ -64,11 +64,13 @@ openclaw:
     sample-rate: 16000
     threshold: 0.5       # 唤醒阈值 0.1~0.9,从白龙马借鉴调到 0.35 (默认 0.6 太高,0.25 太敏)
                          # 2026-08-01 二次调高: 自训练贾维斯过拟合严重, 0.35 还误触, 升到 0.5
+                         # 2026-08-02 训练 v2 加 100 NEG 后模型变哑, 调试过; 还原回 0.5
+                         # 2026-08-02 v2 训练失败, 还原回 overfit 模型 + 0.5 (老配置)
     enabled: true        # 紧急关闭 KWS (设 false 后 KwsService.init() 跳过加载)
     use-ctc: false       # true = CTC (自训练 wake word, 需 sherpa-onnx 升级支持)
                          # false = Transducer (预训练 8 关键词, 当前生效)
     cooldown-ms: 800     # 命中后冷却,防同一句话被识别成多次唤醒 (借鉴白龙马)
-    keywords-score: 3.0  # 唤醒分数偏置 (2026-08-01 调到 3.0 = 白龙马值, 治过拟合误触)
+    keywords-score: 3.0  # 唤醒分数偏置 (2026-08-01 调到 3.0 治过拟合误触; v2 失败后还原回 3.0)
 
   # sherpa-onnx VAD 配置 (v3-vad 新增, 2026-07-30)
   # 复用同一个 sherpa-onnx JVM jar + native lib(已在 STT/KWS 装过)
